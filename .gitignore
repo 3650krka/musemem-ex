@@ -1,0 +1,61 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Environment and secrets
+.env
+.env.*
+*.key
+*.pem
+models.json
+embed-provider.json
+
+
+# Test results and temporary files
+tmp/
+*.jsonl
+results-*
+server.log
+validation.pid
+
+# Internal docs and benchmarks (not for public repo)
+prd/
+bench/
+docs/
+
+# Internal flags, local runners, and validation scripts
+temporal-ab.flag
+tl-harm.flag
+aml/bench-local.ts
+aml/run-validation.ts
+
+# Large benchmark data
+bench/aml-text/data/
+bench/scriptmem/sessions*.json
+bench/scriptmem/*.docx
+bench/scriptmem/run-*.txt
+
+# Pi extension data
+.pi/
+.pi-memory/
+
+# Server logs
+aml/*.log
+
+# Windows scripts (server uses Linux)
+aml/*.cmd
+aml/*.ps1
+
+# AGENTS.md is internal collaboration protocol
+AGENTS.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
