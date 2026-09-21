@@ -31,6 +31,11 @@ temporal-ab.flag
 tl-harm.flag
 aml/bench-local.ts
 aml/run-validation.ts
+# Local harnesses embed the answer-model key — never commit.
+aml/ab-policy.ts
+aml/test-multi.ts
+aml/results-ab.json
+aml/results-*.jsonl
 
 # Large benchmark data
 bench/aml-text/data/
