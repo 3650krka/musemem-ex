@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { mkdirSync, readFileSync } from "node:fs";
 
 import { buildPersona, renderPersona } from "../src/service/persona.ts";
+import { buildCountingAid } from "../src/service/counting-aid.ts";
 import { MemoryStore, recordId } from "../src/core/store.ts";
 import { rankForContext } from "../src/core/ranker.ts";
 import { encodeWithCache, poolChunkScores, type EmbedGateway } from "../src/adapters/embed.ts";
@@ -249,6 +250,17 @@ async function searchPipeline(
     if (tl) {
       results.push({ id: "timeline_index", content: tl, score: 1.0, created_at: new Date().toISOString() });
     }
+    // Explicit reference date for temporal computation — the answer model
+    // needs to know "today" to compute "how many days/weeks/months ago".
+    // Without this, the model defaults to its training cutoff (2024-01).
+    if (questionDate) {
+      results.push({
+        id: "temporal_anchor",
+        content: `[Reference date: ${questionDate}. Compute all time differences from this date.]`,
+        score: 0.999,
+        created_at: new Date().toISOString(),
+      });
+    }
   }
 
   // contrast lines (pattern separation)
@@ -258,6 +270,13 @@ async function searchPipeline(
   );
   if (contrasts.length) {
     results.push({ id: "contrast_pairs", content: contrasts.join("\n"), score: 0.99, created_at: new Date().toISOString() });
+  }
+
+  // Counting aid for "how many" questions (cognitive basis: Miller 1956 —
+  // working memory can't count 80+ raw memories; external aid offloads it).
+  const countingAid = buildCountingAid(query, ranked);
+  if (countingAid) {
+    results.push({ id: "counting_aid", content: countingAid, score: 0.998, created_at: new Date().toISOString() });
   }
 
   // evidence records (top-K by score, after optional diversity rerank)
