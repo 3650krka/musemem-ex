@@ -44,20 +44,15 @@ export function buildCountingAid(
   const entity = extractEntity(query);
   if (!entity) return "";
 
-  // Use top records with score >= 0.3 (lowered from 0.5 — we need to catch
-  // relevant records that might have lower lexical overlap but high semantic relevance).
+  // Use top-ranked records directly (semantic ranking already filtered for relevance).
+  // Present as a numbered list so the model can count without scanning raw text.
   // Skip persona/timeline/contrast pseudo-records.
   const evidence = ranked.filter((r) =>
     r.record.id !== "persona_profile" && r.record.id !== "timeline_index" &&
-    r.record.id !== "contrast_pairs" && r.record.id !== "counting_aid" &&
-    r.score >= 0.3
+    r.record.id !== "contrast_pairs" && r.record.id !== "counting_aid"
   );
   if (evidence.length < 2) return "";
 
-  // Extract numeric values from each record for the counted entity.
-  // This is the key insight: instead of listing raw text, we extract the
-  // numeric value (e.g., "5 days", "3 items") and present it directly.
-  // Cognitive basis: pre-extraction offloads working memory (Cowan 4±1).
   const lines: string[] = [];
   const seen = new Set<string>();
   for (const r of evidence.slice(0, maxItems)) {
@@ -65,18 +60,13 @@ export function buildCountingAid(
     if (fact.length < 10) continue;
     // Skip generic AI responses
     if (/as an ai|i don't have|i cannot|i'm not able/i.test(fact)) continue;
-    
-    // Try to extract a numeric value related to the entity
-    const numericMatch = fact.match(/(\d+(?:\.\d+)?)\s*(?:days?|weeks?|months?|years?|items?|pieces?|projects?|kits?|movies?|books?|trips?|sessions?|hours?|minutes?)/i);
-    const displayFact = numericMatch ? `${numericMatch[0]} — ${fact}` : fact;
-    
     // Deduplicate by first 40 chars
     const key = fact.toLowerCase().slice(0, 40);
     if (seen.has(key)) continue;
     seen.add(key);
-    lines.push(`${lines.length + 1}. ${displayFact}`);
+    lines.push(`${lines.length + 1}. ${fact}`);
   }
 
   if (lines.length < 2) return "";
-  return `[Counting aid — ${lines.length} relevant records for "${entity}". Sum the numeric values to answer.]\n${lines.join("\n")}`;
+  return `[Counting aid — ${lines.length} relevant records for "${entity}". Count each unique item before answering.]\n${lines.join("\n")}`;
 }
