@@ -250,16 +250,34 @@ async function searchPipeline(
     if (tl) {
       results.push({ id: "timeline_index", content: tl, score: 1.0, created_at: new Date().toISOString() });
     }
-    // Explicit reference date for temporal computation — the answer model
-    // needs to know "today" to compute "how many days/weeks/months ago".
-    // Without this, the model defaults to its training cutoff (2024-01).
+    // Explicit reference date + pre-computed time differences.
+    // The answer model needs to know "today" AND the difference for each event.
+    // Pre-computing offloads the calendar arithmetic from the answer model.
     if (questionDate) {
-      results.push({
-        id: "temporal_anchor",
-        content: `[Reference date: ${questionDate}. Compute all time differences from this date.]`,
-        score: 0.999,
-        created_at: new Date().toISOString(),
-      });
+      const anchor = parseYMD(questionDate);
+      if (anchor) {
+        const anchorStr = `${anchor.y}-${String(anchor.m).padStart(2, "0")}-${String(anchor.d).padStart(2, "0")}`;
+        const diffs: string[] = [];
+        for (const r of ranked.slice(0, 10)) {
+          const recDate = r.record.metadata["date"] as string | undefined;
+          if (!recDate) continue;
+          const rec = parseYMD(recDate);
+          if (!rec) continue;
+          const days = Math.round((Date.UTC(anchor.y, anchor.m - 1, anchor.d) - Date.UTC(rec.y, rec.m - 1, rec.d)) / 86400000);
+          if (days > 0) {
+            const fact = r.record.content.split("\n").slice(1).join(" ").slice(0, 80);
+            diffs.push(`${days} days before ${anchorStr}: ${fact}`);
+          }
+        }
+        if (diffs.length) {
+          results.push({
+            id: "temporal_anchor",
+            content: `[Temporal reference: ${anchorStr}]\n[Time differences from reference:]\n${diffs.join("\n")}`,
+            score: 0.999,
+            created_at: new Date().toISOString(),
+          });
+        }
+      }
     }
   }
 
@@ -277,6 +295,18 @@ async function searchPipeline(
   const countingAid = buildCountingAid(query, ranked);
   if (countingAid) {
     results.push({ id: "counting_aid", content: countingAid, score: 0.998, created_at: new Date().toISOString() });
+  }
+
+  // Knowledge-update marker: for the most recent version of each fact,
+  // add a [Latest] tag so the answer model knows which version to use.
+  // Cognitive basis: recency effect (Murdock, 1962) — the most recent
+  // information is the most accessible, but only if it's marked as such.
+  const latestByTopic = new Map<string, string>(); // topic → latest record id
+  for (const r of finalRanked) {
+    const topic = r.record.metadata["topicKey"] as string | undefined;
+    if (topic && !latestByTopic.has(topic)) {
+      latestByTopic.set(topic, r.record.id);
+    }
   }
 
   // For counting questions: return ONLY the counting aid + top 5 evidence
@@ -310,9 +340,15 @@ async function searchPipeline(
     if (results.length >= topK) break;
     if (totalChars + r.record.content.length > CHAR_BUDGET && results.length > 0) break;
     totalChars += r.record.content.length;
+    
+    // Mark the latest version of each topic with [Latest] so the answer
+    // model knows which version to use for knowledge-update questions.
+    const isLatest = latestByTopic.get(r.record.metadata["topicKey"] as string ?? "") === r.record.id;
+    const content = isLatest ? `[Latest] ${r.record.content}` : r.record.content;
+    
     results.push({
       id: r.record.id,
-      content: r.record.content,
+      content,
       score: Math.min(0.98, r.score),
       created_at: new Date().toISOString(),
     });
