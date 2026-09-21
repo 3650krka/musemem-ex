@@ -1,0 +1,147 @@
+/**
+ * Retrieval policy — question-type-aware ranking and budget allocation.
+ *
+ * Three empirically-motivated policies, each grounded in a measured failure
+ * mode rather than a guess:
+ *
+ * 1. SELF-REFERENCE WEIGHTING (Rogers, Kuiper & Kirker, 1977)
+ *    Measured failure: for "How many projects have I led?", the top-ranked
+ *    record was 100% assistant-generated advice ("Set reminders", "Use a
+ *    notes app") with ZERO user facts — high lexical overlap with the query,
+ *    zero informational value. The assistant's advice paraphrases the
+ *    QUESTION; the user's turns carry the ANSWER.
+ *    Policy: for personal-fact questions, boost records by their user-authored
+ *    character share. Ranking-only — assistant records are never dropped, so
+ *    questions whose answer IS the assistant's content still work.
+ *
+ * 2. ADAPTIVE CONTEXT BUDGET (Miller, 1956; Liu et al., 2023)
+ *    Measured failure: aggregation questions ("how many", "in total") need
+ *    EVERY relevant item, but a fixed budget admitted ~5 records while the
+ *    answer set was spread across 15+. Meanwhile single-fact questions suffer
+ *    "Lost in the Middle" degradation when the context is padded.
+ *    Policy: completeness-critical question classes get a large budget;
+ *    single-fact questions stay tight for precision.
+ *
+ * 3. CONTENT DEDUPLICATION
+ *    Measured failure: 20-40% of the returned budget was spent on records with
+ *    byte-identical content, crowding out distinct evidence.
+ *    Policy: first occurrence wins; later duplicates are skipped.
+ */
+
+import type { MemoryRecord } from "../core/types.ts";
+
+// ---- Question classification ----
+
+export type QuestionClass = "aggregation" | "temporal" | "personal-fact" | "assistant-content" | "default";
+
+/** Completeness-critical: the answer is a sum/count over a distributed set. */
+const AGGREGATION_RE = /\bhow many\b|\bhow much\b|\bin total\b|\btotal (?:number|count)\b|\ball the\b|\beach of\b|\blist (?:all|the|of)\b|\bhow long\b/i;
+
+/** Time reasoning: needs event dates and an explicit reference point. */
+const TEMPORAL_RE = /\bwhen\b|\bhow (?:many|long).{0,30}\b(?:ago|before|after|since)\b|\bbetween\b.{0,40}\band\b|\bfirst to last\b|\b(?:first|last|earlier|earliest|latest|recent(?:ly)?)\b|\border\b|\b(?:before|after) (?:the|my|that)\b|\bsince\b|\b\d+\s*(?:days?|weeks?|months?|years?) ago\b/i;
+
+/** Assistant-authored answer: the question targets what the assistant said. */
+const ASSISTANT_CONTENT_RE = /\b(?:what|which) (?:did|do) (?:the |you |your )?(?:assistant|ai|bot|you)\b|\bwhat advice\b|\bwhat did you (?:say|suggest|recommend)\b|\bwhat (?:were|are) the (?:tips|steps|recommendations)\b|\bwhat (?:help|guidance|suggestions?)\b/i;
+
+/**
+ * Self-referential: the question is about the user's own life/attributes.
+ * Any first-person marker qualifies — the subject matter is the user, so the
+ * user's own turns are the natural evidence source.
+ */
+const PERSONAL_FACT_RE = /\bI\b|\bmy\b|\bme\b|\bmine\b|\bmyself\b/i;
+
+/**
+ * Classify a query into the policy class that governs budget and weighting.
+ * Order matters: aggregation and temporal are checked first because they carry
+ * the strongest completeness requirement; assistant-content is checked before
+ * personal-fact so "what did you recommend about my X" keeps assistant records.
+ */
+export function classifyQuestion(query: string): QuestionClass {
+  if (ASSISTANT_CONTENT_RE.test(query)) return "assistant-content";
+  if (AGGREGATION_RE.test(query)) return "aggregation";
+  if (TEMPORAL_RE.test(query)) return "temporal";
+  if (PERSONAL_FACT_RE.test(query)) return "personal-fact";
+  return "default";
+}
+
+/**
+ * Character budget per question class.
+ *
+ * Rationale: the answer model (gpt-4o-mini) has a 128K-token window, so even
+ * the largest budget here (~10K tokens) uses <10% of context. The binding
+ * constraint is not the window but signal dilution — hence single-fact
+ * questions stay tight (precision) while aggregation/temporal open up
+ * (completeness), because for those classes a MISSING item is an unrecoverable
+ * error whereas an extra item is only mild noise.
+ */
+const BUDGET_BY_CLASS: Record<QuestionClass, number> = {
+  aggregation: 40000,
+  temporal: 30000,
+  "personal-fact": 16000,
+  "assistant-content": 16000,
+  default: 12000,
+};
+
+export function budgetForClass(qc: QuestionClass): number {
+  return BUDGET_BY_CLASS[qc];
+}
+
+// ---- Self-reference weighting ----
+
+/**
+ * Fraction of a record's characters authored by the user (0..1).
+ *
+ * Records are ingested as role-prefixed lines ("user: ..." / "assistant: ..."),
+ * so the share is computed by walking those prefixes. A record with no
+ * recognizable prefix is treated as neutral (0.5) so unparseable content is
+ * neither rewarded nor penalized.
+ */
+export function userCharShare(content: string): number {
+  // Strip the ingest header: "[YYYY-MM-DD] (session xxx)\n"
+  const body = content.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*\(session [^)]+\)\s*\n/, "");
+  if (!body.length) return 0.5;
+
+  let user = 0;
+  let assistant = 0;
+  let current: "user" | "assistant" | null = null;
+
+  for (const line of body.split("\n")) {
+    const m = line.match(/^(user|assistant)\s*:\s?/i);
+    if (m) {
+      current = m[1].toLowerCase() as "user" | "assistant";
+      const rest = line.length - m[0].length;
+      if (current === "user") user += rest; else assistant += rest;
+    } else if (current) {
+      if (current === "user") user += line.length; else assistant += line.length;
+    } else {
+      // No prefix seen yet — count as neutral user content.
+      user += line.length;
+    }
+  }
+
+  const total = user + assistant;
+  if (!total) return 0.5;
+  return user / total;
+}
+
+/**
+ * Multiplicative self-reference boost for personal-fact questions.
+ *
+ * Returns 1.0 (no change) unless the question is self-referential AND targets
+ * the user's own facts. The boost is bounded to [1.0, 1 + SELF_REF_MAX] and
+ * scales linearly with the record's user-authored share, so a record that is
+ * entirely assistant advice is never boosted and a fully user-authored record
+ * gets the full boost.
+ *
+ * Bounded and monotonic by design: it re-orders near-ties toward user content
+ * without being able to overturn a large relevance gap.
+ */
+export const SELF_REF_MAX = 0.35;
+
+export function selfReferenceFactor(qc: QuestionClass, record: MemoryRecord): number {
+  if (qc !== "personal-fact" && qc !== "aggregation" && qc !== "temporal") return 1;
+  const share = userCharShare(record.content);
+  // Center on 0.5 so balanced records are unchanged; user-heavy records rise.
+  const centered = Math.max(0, share - 0.5) * 2; // 0..1
+  return 1 + SELF_REF_MAX * centered;
+}

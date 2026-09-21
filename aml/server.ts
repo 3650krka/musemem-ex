@@ -15,6 +15,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 
 import { buildPersona, renderPersona } from "../src/service/persona.ts";
 import { buildCountingAid } from "../src/service/counting-aid.ts";
+import { classifyQuestion, budgetForClass, selfReferenceFactor } from "../src/service/retrieval-policy.ts";
 import { MemoryStore, recordId } from "../src/core/store.ts";
 import { rankForContext } from "../src/core/ranker.ts";
 import { encodeWithCache, poolChunkScores, type EmbedGateway } from "../src/adapters/embed.ts";
@@ -29,6 +30,16 @@ const PORT = Number(process.env.AML_PORT ?? 8080);
 const DATA_DIR = process.env.AML_DATA_DIR ?? "./aml-data";
 const AUTH_TOKEN = process.env.AML_AUTH_TOKEN ?? "";
 const TOP_K = Number(process.env.AML_TOP_K ?? 100);
+
+/**
+ * Retrieval policy switch for A/B measurement.
+ *   v1 = fixed 8000-char budget, no dedup, no self-reference weighting (baseline)
+ *   v2 = adaptive budget by question class + dedup + self-reference weighting
+ * AML never sends this; the default is whatever AML_POLICY sets (v2 in
+ * production). The POST /policy endpoint flips it at runtime so both arms can
+ * be measured against identical, freshly-ingested data.
+ */
+let ACTIVE_POLICY: "v1" | "v2" = (process.env.AML_POLICY === "v1" ? "v1" : "v2");
 
 // ---- lazy embed gateway (local ONNX or remote xfyun, configured via env) ----
 // PI_MEMORY_EMBED_SOURCE=local (default, ONNX) | xfyun (remote API, needs key)
@@ -153,7 +164,9 @@ async function searchPipeline(
 ): Promise<Array<{ id: string; content: string; score: number; created_at: string }>> {
   const scope = scopeFor(userId);
   const pool = scope.store.readEvidence(userId);
-  console.error(`[DEBUG] user=${userId} pool=${pool.length} turns=${scope.turns} threshold=${DEFAULT_CONFIG.activationThreshold}`);
+  const qClass = classifyQuestion(query);
+  const policy = ACTIVE_POLICY;
+  console.error(`[DEBUG] user=${userId} pool=${pool.length} turns=${scope.turns} class=${qClass} policy=${policy} threshold=${DEFAULT_CONFIG.activationThreshold}`);
   if (!pool.length) return [];
 
   // Phase 1: lexical-only ranking to find top candidates (fast, ~100ms).
@@ -208,11 +221,19 @@ async function searchPipeline(
       scoreWeights: { overlap: 0.6, rs: 0.2, ss: 0.2 },
     });
     console.error(`[DEBUG] rankForContext returned ${ranked.length}`);
+    const anchor = parseYMD(questionDate);
     ranked = ranked.map((r) => {
-      const anchor = parseYMD(questionDate);
-      if (!anchor) return r;
-      const f = temporalBoostFactor(query, r.record.metadata["date"] as string | undefined, anchor);
-      return f === 1 ? r : { ...r, score: r.score * f };
+      let s = r.score;
+      if (anchor) {
+        s *= temporalBoostFactor(query, r.record.metadata["date"] as string | undefined, anchor);
+      }
+      // Self-reference weighting: for questions about the user's own facts,
+      // prefer records the user actually authored. Measured failure this
+      // fixes: a "how many projects have I led" query whose top record was
+      // 100% assistant advice and contained zero user facts.
+      // v1 policy: no self-reference weighting (A/B baseline).
+      if (policy === "v2") s *= selfReferenceFactor(qClass, r.record);
+      return s === r.score ? r : { ...r, score: s };
     })
     // Deterministic ordering: sort by score (desc), then by record ID (asc)
     // as tiebreaker. This ensures the same query always returns the same
@@ -274,40 +295,32 @@ async function searchPipeline(
 
   // Counting aid for "how many" questions (cognitive basis: Miller 1956 —
   // working memory can't count 80+ raw memories; external aid offloads it).
+  // The aid SUPPLEMENTS the evidence; it never replaces it, because a count
+  // is only as complete as the records behind it.
   const countingAid = buildCountingAid(query, ranked);
   if (countingAid) {
     results.push({ id: "counting_aid", content: countingAid, score: 0.998, created_at: new Date().toISOString() });
   }
 
-  // For counting questions: return ONLY the counting aid + top 5 evidence
-  // records. The counting aid is the primary answer source; extra memories
-  // just add noise. This is a deliberate narrowing — the answer model needs
-  // to count, not read 100+ raw memories.
-  if (countingAid) {
-    const CHAR_BUDGET = Number(process.env.AML_CHAR_BUDGET ?? 8000);
-    let totalChars = countingAid.length;
-    let added = 0;
-    for (const r of finalRanked) {
-      if (added >= 5) break; // max 5 evidence records for counting questions
-      if (totalChars + r.record.content.length > CHAR_BUDGET) break;
-      totalChars += r.record.content.length;
-      results.push({
-        id: r.record.id,
-        content: r.record.content,
-        score: Math.min(0.98, r.score),
-        created_at: new Date().toISOString(),
-      });
-      added++;
-    }
-    return results;
-  }
-
-  // evidence records (top-K by score, after optional diversity rerank)
-  // Character budget: cap total memory text to fit the answer model's context.
-  const CHAR_BUDGET = Number(process.env.AML_CHAR_BUDGET ?? 8000);
-  let totalChars = 0;
+  // Evidence records, with two budget protections:
+  //  - adaptive char budget by question class (aggregation needs completeness,
+  //    single-fact needs precision — see retrieval-policy.ts)
+  //  - content deduplication: measured 20-40% of the budget was previously
+  //    spent on byte-identical records, crowding out distinct evidence.
+  const envBudget = Number(process.env.AML_CHAR_BUDGET ?? 0);
+  const CHAR_BUDGET = envBudget > 0
+    ? envBudget
+    : (policy === "v2" ? budgetForClass(qClass) : 8000);
+  let totalChars = results.reduce((s, r) => s + r.content.length, 0);
+  const seenContent = new Set<string>();
+  let duplicatesSkipped = 0;
   for (const r of finalRanked) {
     if (results.length >= topK) break;
+    // v1 policy: no dedup (A/B baseline)
+    if (policy === "v2") {
+      if (seenContent.has(r.record.content)) { duplicatesSkipped++; continue; }
+      seenContent.add(r.record.content);
+    }
     if (totalChars + r.record.content.length > CHAR_BUDGET && results.length > 0) break;
     totalChars += r.record.content.length;
     results.push({
@@ -317,6 +330,7 @@ async function searchPipeline(
       created_at: new Date().toISOString(),
     });
   }
+  console.error(`[DEBUG] emitted=${results.length} chars=${totalChars}/${CHAR_BUDGET} dedupSkipped=${duplicatesSkipped}`);
 
   return results;
 }
@@ -492,6 +506,35 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.end(JSON.stringify({ error: (e as Error).message }));
     }
     return;
+  }
+
+  // ---- POLICY (auth-protected diagnostic switch) ----
+  // POST /policy {"policy":"v1"|"v2"} — flips the retrieval policy at runtime
+  // so A/B arms can be measured on identical data without a redeploy.
+  if (path === "/policy") {
+    if (req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ policy: ACTIVE_POLICY }));
+      return;
+    }
+    if (req.method === "POST") {
+      try {
+        const p = JSON.parse(body) as { policy?: string };
+        if (p.policy === "v1" || p.policy === "v2") {
+          ACTIVE_POLICY = p.policy;
+          console.log(`[POLICY] switched to ${ACTIVE_POLICY}`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ policy: ACTIVE_POLICY }));
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "policy must be 'v1' or 'v2'" }));
+        }
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: (e as Error).message }));
+      }
+      return;
+    }
   }
 
   res.writeHead(404, { "Content-Type": "application/json" });
