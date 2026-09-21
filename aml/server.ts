@@ -467,6 +467,33 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     return;
   }
 
+  // ---- DEPLOY (auth-protected) ----
+  // POST /deploy — git pull + restart. Requires valid auth token.
+  // Used for remote deployment updates without SSH access.
+  if (path === "/deploy" && req.method === "POST") {
+    if (!AUTH_TOKEN) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "deploy disabled (no auth token)" }));
+      return;
+    }
+    try {
+      const { execSync } = await import("node:child_process");
+      const pullOut = execSync("git pull", { cwd: process.cwd(), encoding: "utf8", timeout: 30000 });
+      console.log("[DEPLOY] git pull:", pullOut.trim());
+      // Schedule restart after response is sent
+      setTimeout(() => {
+        console.log("[DEPLOY] restarting service...");
+        execSync("sudo systemctl restart musemem", { encoding: "utf8", timeout: 10000 });
+      }, 1000);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, message: "pulled and restarting", output: pullOut.trim() }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: (e as Error).message }));
+    }
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "not found", path }));
 });
