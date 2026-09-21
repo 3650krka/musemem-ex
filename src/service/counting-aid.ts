@@ -38,18 +38,20 @@ function extractKeyFact(content: string): string {
 export function buildCountingAid(
   query: string,
   ranked: ReadonlyArray<{ record: MemoryRecord; score: number }>,
-  maxItems = 25,
+  maxItems = 15,
 ): string {
   if (!COUNTING_RE.test(query)) return "";
   const entity = extractEntity(query);
   if (!entity) return "";
 
-  // Use top-ranked records directly (semantic ranking already filtered for relevance).
+  // Only use TOP records (score >= 0.5) — the counting aid should only
+  // include highly relevant records, not the entire ranked list.
   // Present as a numbered list so the model can count without scanning raw text.
   // Skip persona/timeline/contrast pseudo-records.
   const evidence = ranked.filter((r) =>
     r.record.id !== "persona_profile" && r.record.id !== "timeline_index" &&
-    r.record.id !== "contrast_pairs" && r.record.id !== "counting_aid"
+    r.record.id !== "contrast_pairs" && r.record.id !== "counting_aid" &&
+    r.score >= 0.5
   );
   if (evidence.length < 2) return "";
 

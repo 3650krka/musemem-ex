@@ -279,6 +279,29 @@ async function searchPipeline(
     results.push({ id: "counting_aid", content: countingAid, score: 0.998, created_at: new Date().toISOString() });
   }
 
+  // For counting questions: return ONLY the counting aid + top 5 evidence
+  // records. The counting aid is the primary answer source; extra memories
+  // just add noise. This is a deliberate narrowing — the answer model needs
+  // to count, not read 100+ raw memories.
+  if (countingAid) {
+    const CHAR_BUDGET = Number(process.env.AML_CHAR_BUDGET ?? 8000);
+    let totalChars = countingAid.length;
+    let added = 0;
+    for (const r of finalRanked) {
+      if (added >= 5) break; // max 5 evidence records for counting questions
+      if (totalChars + r.record.content.length > CHAR_BUDGET) break;
+      totalChars += r.record.content.length;
+      results.push({
+        id: r.record.id,
+        content: r.record.content,
+        score: Math.min(0.98, r.score),
+        created_at: new Date().toISOString(),
+      });
+      added++;
+    }
+    return results;
+  }
+
   // evidence records (top-K by score, after optional diversity rerank)
   // Character budget: cap total memory text to fit the answer model's context.
   const CHAR_BUDGET = Number(process.env.AML_CHAR_BUDGET ?? 8000);
