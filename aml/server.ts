@@ -16,6 +16,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { buildPersona, renderPersona } from "../src/service/persona.ts";
 import { buildCountingAid } from "../src/service/counting-aid.ts";
 import { classifyQuestion, budgetForClass, selfReferenceFactor } from "../src/service/retrieval-policy.ts";
+import { buildRecencyChains, renderRecencyBlock, semanticSimilarityFromVecs } from "../src/service/recency.ts";
 import { MemoryStore, recordId } from "../src/core/store.ts";
 import { rankForContext } from "../src/core/ranker.ts";
 import { encodeWithCache, poolChunkScores, type EmbedGateway } from "../src/adapters/embed.ts";
@@ -35,11 +36,14 @@ const TOP_K = Number(process.env.AML_TOP_K ?? 100);
  * Retrieval policy switch for A/B measurement.
  *   v1 = fixed 8000-char budget, no dedup, no self-reference weighting (baseline)
  *   v2 = adaptive budget by question class + dedup + self-reference weighting
- * AML never sends this; the default is whatever AML_POLICY sets (v2 in
- * production). The POST /policy endpoint flips it at runtime so both arms can
- * be measured against identical, freshly-ingested data.
+ *   v3 = v2 + semantic recency chains that label the CURRENT value when an
+ *        attribute was updated (targets the measured knowledge-update failures)
+ * AML never sends this; the default comes from AML_POLICY. The POST /policy
+ * endpoint flips it at runtime so every arm can be measured against identical,
+ * freshly-ingested data.
  */
-let ACTIVE_POLICY: "v1" | "v2" = (process.env.AML_POLICY === "v1" ? "v1" : "v2");
+let ACTIVE_POLICY: "v1" | "v2" | "v3" =
+  process.env.AML_POLICY === "v1" ? "v1" : process.env.AML_POLICY === "v2" ? "v2" : "v3";
 
 // ---- lazy embed gateway (local ONNX or remote xfyun, configured via env) ----
 // PI_MEMORY_EMBED_SOURCE=local (default, ONNX) | xfyun (remote API, needs key)
@@ -184,6 +188,9 @@ async function searchPipeline(
   // about commute duration. Cognitive basis: human associative memory retrieves
   // by meaning, not keyword match (spreading activation, Collins & Loftus 1975).
   let semanticScores: Map<string, number> | undefined;
+  // Chunk vectors are retained (not just their pooled query scores) so v3 can
+  // compute RECORD-to-RECORD similarity for update-chain detection.
+  let chunkVecs: Map<string, Float32Array> | undefined;
   const gw = await getEmbed();
   console.error(`[DEBUG] embed gw=${gw ? 'loaded' : 'null'}`);
   if (gw && pool.length) {
@@ -195,6 +202,7 @@ async function searchPipeline(
         const vecs = await encodeWithCache(scope.store, userId, pool, gw);
         const qv = await gw.encodeQuery(query);
         semanticScores = poolChunkScores(vecs, qv);
+        chunkVecs = vecs;
         console.error(`[DEBUG] semantic ok: ${semanticScores?.size ?? 0} entries (full pool)`);
         break;
       } catch (e) {
@@ -232,7 +240,7 @@ async function searchPipeline(
       // fixes: a "how many projects have I led" query whose top record was
       // 100% assistant advice and contained zero user facts.
       // v1 policy: no self-reference weighting (A/B baseline).
-      if (policy === "v2") s *= selfReferenceFactor(qClass, r.record);
+      if (policy !== "v1") s *= selfReferenceFactor(qClass, r.record);
       return s === r.score ? r : { ...r, score: s };
     })
     // Deterministic ordering: sort by score (desc), then by record ID (asc)
@@ -251,6 +259,23 @@ async function searchPipeline(
   const finalRanked = DIVERSITY > 0 ? sessionDiversityRerank(ranked, DIVERSITY) : ranked;
 
   const results: Array<{ id: string; content: string; score: number; created_at: string }> = [];
+
+  // v3: semantic recency chains. Placed FIRST because for an updated attribute
+  // it directly resolves which competing value answers the question — measured
+  // failure mode: gold and stale were both retrieved (gold at rank 1) and the
+  // answer model still picked the stale one. Fail-closed when vectors are absent.
+  if (policy === "v3" && chunkVecs) {
+    try {
+      const chains = buildRecencyChains(ranked, semanticSimilarityFromVecs(chunkVecs));
+      const block = renderRecencyBlock(chains);
+      if (block) {
+        results.push({ id: "recency_chains", content: block, score: 0.9995, created_at: new Date().toISOString() });
+        console.error(`[DEBUG] recency chains=${chains.length} blockChars=${block.length}`);
+      }
+    } catch (e) {
+      console.error(`[DEBUG] recency FAIL: ${(e as Error).message?.slice(0, 100)}`);
+    }
+  }
 
   // Persona injection: deterministic user profile from topic frequency.
   // Fail-closed: persona construction must never break the search.
@@ -310,14 +335,14 @@ async function searchPipeline(
   const envBudget = Number(process.env.AML_CHAR_BUDGET ?? 0);
   const CHAR_BUDGET = envBudget > 0
     ? envBudget
-    : (policy === "v2" ? budgetForClass(qClass) : 8000);
+    : (policy === "v1" ? 8000 : budgetForClass(qClass));
   let totalChars = results.reduce((s, r) => s + r.content.length, 0);
   const seenContent = new Set<string>();
   let duplicatesSkipped = 0;
   for (const r of finalRanked) {
     if (results.length >= topK) break;
     // v1 policy: no dedup (A/B baseline)
-    if (policy === "v2") {
+    if (policy !== "v1") {
       if (seenContent.has(r.record.content)) { duplicatesSkipped++; continue; }
       seenContent.add(r.record.content);
     }
@@ -520,14 +545,14 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     if (req.method === "POST") {
       try {
         const p = JSON.parse(body) as { policy?: string };
-        if (p.policy === "v1" || p.policy === "v2") {
+        if (p.policy === "v1" || p.policy === "v2" || p.policy === "v3") {
           ACTIVE_POLICY = p.policy;
           console.log(`[POLICY] switched to ${ACTIVE_POLICY}`);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ policy: ACTIVE_POLICY }));
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "policy must be 'v1' or 'v2'" }));
+          res.end(JSON.stringify({ error: "policy must be 'v1', 'v2' or 'v3'" }));
         }
       } catch (e) {
         res.writeHead(400, { "Content-Type": "application/json" });

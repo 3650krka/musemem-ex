@@ -30,14 +30,14 @@ const MIN_TOKEN_LEN = 4;
 const MAX_UNIQUE_TOKENS = 5;
 
 /** Filter token sets to content-signal tokens (length ≥ 4 to drop function words). */
-function discriminativeTokens(text: string): Set<string> {
+export function discriminativeTokens(text: string): Set<string> {
   const s = tokenSet(text);
   for (const t of s) if (t.length < MIN_TOKEN_LEN) s.delete(t);
   return s;
 }
 
 /** Compute containment overlap between two token sets: shared / min(|a|,|b|). */
-function containment(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
+export function containment(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
   if (a.size === 0 || b.size === 0) return 0;
   let shared = 0;
   for (const t of a) if (b.has(t)) shared++;
