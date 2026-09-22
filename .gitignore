@@ -32,7 +32,8 @@ tl-harm.flag
 aml/bench-local.ts
 aml/run-validation.ts
 # Local harnesses embed the answer-model key — never commit.
-aml/ab-policy.ts
+# Globbed so a newly added harness cannot be committed by accident.
+aml/ab-*.ts
 aml/test-multi.ts
 aml/results-ab.json
 aml/results-*.jsonl
