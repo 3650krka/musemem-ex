@@ -52,7 +52,7 @@ function rec(id: string, content: string): MemoryRecord {
 
 // ---------- 2. ledger in consolidation ----------
 test("consolidation prompt requests entity-state ledger rows in the same call", () => {
-  const p = buildConsolidationPrompt([{ id: "mem_x", content: "user: exchanged boots at Zara, need to pick up new pair", turn: 3 } as never]);
+  const p = buildConsolidationPrompt([{ id: "mem_x", content: "user: swapped the bench vise at the tool library, need to collect the replacement", turn: 3 } as never]);
   assert.ok(p.includes("ledger"), "ledger requested");
   assert.ok(p.includes("pending"), "state vocabulary defined");
   assert.ok(p.includes("facts"), "facts still primary output");
@@ -60,15 +60,15 @@ test("consolidation prompt requests entity-state ledger rows in the same call", 
 
 test("parseFactCards accepts ledger rows with entity/state fields", () => {
   const json = JSON.stringify({
-    facts: [{ fact: "Zara boots exchange pending pickup", topicKey: "zara-boots", category: "fact", sourceIds: ["mem_x"] }],
-    ledger: [{ entity: "Zara boots", state: "pending / to pick up", date: "2023-02-15", sourceIds: ["mem_x"] }],
+    facts: [{ fact: "bench vise swap pending collection", topicKey: "bench-vise", category: "fact", sourceIds: ["mem_x"] }],
+    ledger: [{ entity: "bench vise", state: "pending / to pick up", date: "2023-02-15", sourceIds: ["mem_x"] }],
   });
   const cards = parseFactCards(json, new Set(["mem_x"]));
   assert.equal(cards.filter((c) => c.ledger !== true).length, 1, "fact card");
   const led = cards.filter((c) => c.ledger === true);
   assert.equal(led.length, 1, "ledger card");
-  assert.equal(led[0].fact, "[ledger] Zara boots | pending / to pick up | 2023-02-15");
-  assert.equal(led[0].topicKey, "ledger-zara-boots", "ledger topicKey namespaced for supersession chain");
+  assert.equal(led[0].fact, "[ledger] bench vise | pending / to pick up | 2023-02-15");
+  assert.equal(led[0].topicKey, "ledger-bench-vise", "ledger topicKey namespaced for supersession chain");
 });
 
 test("parseFactCards drops ledger rows with dangling sourceIds (provenance inviolable)", () => {
@@ -86,7 +86,7 @@ const PROJ = "pi|/test/r";
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "pimem-ledger-e2e-"));
   store = new MemoryStore(join(dir, "store"));
-  store.appendEvidence(SESS, rec("mem_x", "user: exchanged boots at Zara, need to pick up the new pair"));
+  store.appendEvidence(SESS, rec("mem_x", "user: swapped the bench vise at the tool library, need to collect the replacement"));
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -96,8 +96,8 @@ test("ledger e2e: consolidation JSON → L1 metadata.ledger → resident Entity-
     complete: async (p: string) => {
       (gw.calls as string[]).push(p);
       return JSON.stringify({
-        facts: [{ fact: "Zara boots exchange: new pair awaiting pickup", topicKey: "zara-boots", category: "fact", sourceIds: ["mem_x"] }],
-        ledger: [{ entity: "Zara boots", state: "pending / to pick up", date: "2023-02-15", sourceIds: ["mem_x"] }],
+        facts: [{ fact: "bench vise swap: replacement awaiting collection", topicKey: "bench-vise", category: "fact", sourceIds: ["mem_x"] }],
+        ledger: [{ entity: "bench vise", state: "pending / to pick up", date: "2023-02-15", sourceIds: ["mem_x"] }],
       });
     },
   };
@@ -110,7 +110,7 @@ test("ledger e2e: consolidation JSON → L1 metadata.ledger → resident Entity-
   assert.ok(led!.content.includes("pending / to pick up"));
   assert.ok(led!.sourceRefs.includes("mem_x"), "provenance intact");
 
-  const inj = buildInjection(store, SESS, PROJ, join(dir, "note"), 5, "zara boots pickup status", "", DEFAULT_CONFIG, 0, []);
+  const inj = buildInjection(store, SESS, PROJ, join(dir, "note"), 5, "bench vise collection status", "", DEFAULT_CONFIG, 0, []);
   assert.ok(inj.text.includes("Entity ledger"), "resident ledger section rendered");
   assert.ok(inj.text.includes("pending / to pick up"), "state row delivered");
   assert.ok(!inj.surfacedIds.includes(led!.id), "no double delivery: ledger card excluded from ranked pool");
@@ -118,11 +118,11 @@ test("ledger e2e: consolidation JSON → L1 metadata.ledger → resident Entity-
 });
 
 test("ledger e2e: a later state update supersedes the old row (entity state machine)", async () => {
-  const gw1 = { complete: async () => JSON.stringify({ facts: [], ledger: [{ entity: "Zara boots", state: "pending / to pick up", date: "2023-02-15", sourceIds: ["mem_x"] }] }) };
+  const gw1 = { complete: async () => JSON.stringify({ facts: [], ledger: [{ entity: "bench vise", state: "pending / to pick up", date: "2023-02-15", sourceIds: ["mem_x"] }] }) };
   await consolidate({ store, sessScope: SESS, projScope: PROJ, sessionId: "s1", turn: 4, gateway: gw1 });
 
-  store.appendEvidence(SESS, rec("mem_y", "user: picked up the Zara boots today"));
-  const gw2 = { complete: async () => JSON.stringify({ facts: [], ledger: [{ entity: "Zara boots", state: "completed", date: "2023-02-20", sourceIds: ["mem_y"] }] }) };
+  store.appendEvidence(SESS, rec("mem_y", "user: collected the bench vise today"));
+  const gw2 = { complete: async () => JSON.stringify({ facts: [], ledger: [{ entity: "bench vise", state: "completed", date: "2023-02-20", sourceIds: ["mem_y"] }] }) };
   await consolidate({ store, sessScope: SESS, projScope: PROJ, sessionId: "s1", turn: 7, gateway: gw2 });
 
   const active = store.readDerived(PROJ, "L1").filter((r) => r.metadata["ledger"] === true && r.supersededBy === undefined);
@@ -132,11 +132,11 @@ test("ledger e2e: a later state update supersedes the old row (entity state mach
 
 // ---------- 3. epistemic protocol ----------
 test("injection carries the memory epistemic protocol; empty memory stays empty", () => {
-  const inj = buildInjection(store, SESS, PROJ, join(dir, "note"), 5, "zara boots", "", DEFAULT_CONFIG, 0, []);
+  const inj = buildInjection(store, SESS, PROJ, join(dir, "note"), 5, "bench vise", "", DEFAULT_CONFIG, 0, []);
   assert.ok(inj.text.includes("NON-AUTHORITATIVE hints from past context"), "protocol framing");
   assert.ok(inj.text.includes("take precedence"), "current-context precedence");
   const emptyStore = new MemoryStore(join(dir, "empty"));
-  const none = buildInjection(emptyStore, "pi|/test/r|none", PROJ, join(dir, "note"), 1, "zara boots", "", DEFAULT_CONFIG, 0, []);
+  const none = buildInjection(emptyStore, "pi|/test/r|none", PROJ, join(dir, "note"), 1, "bench vise", "", DEFAULT_CONFIG, 0, []);
   assert.equal(none.text, "", "no protocol injected when there is no memory content");
 });
 
@@ -144,11 +144,11 @@ test("injection carries the memory epistemic protocol; empty memory stays empty"
 test("memory leads wired into product injection only under PI_MEMORY_MEMMAP=1", () => {
   process.env.PI_MEMORY_MEMMAP = "1";
   try {
-    const withEnv = buildInjection(store, SESS, PROJ, join(dir, "note"), 5, "zara boots pickup", "", DEFAULT_CONFIG, 0, []);
+    const withEnv = buildInjection(store, SESS, PROJ, join(dir, "note"), 5, "bench vise collection", "", DEFAULT_CONFIG, 0, []);
     assert.ok(withEnv.text.includes("Memory leads"), "leads section when enabled");
     assert.ok(withEnv.text.includes("mem_x"), "pointer id present");
     delete process.env.PI_MEMORY_MEMMAP;
-    const without = buildInjection(store, SESS, PROJ, join(dir, "note"), 5, "zara boots pickup", "", DEFAULT_CONFIG, 0, []);
+    const without = buildInjection(store, SESS, PROJ, join(dir, "note"), 5, "bench vise collection", "", DEFAULT_CONFIG, 0, []);
     assert.ok(!without.text.includes("Memory leads"), "no leads section by default");
   } finally {
     delete process.env.PI_MEMORY_MEMMAP;

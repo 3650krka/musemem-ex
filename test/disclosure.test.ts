@@ -1,10 +1,25 @@
 /**
- * disclosure tests — assertions are the MEASURED production sentences.
+ * disclosure tests.
  *
- * Every "real case" below is a verbatim transcription of a sentence from the
- * LongMemEval-S records that the deployed v2 retrieval already surfaced but the
- * answer model failed on. The tests therefore lock in behaviour that was
- * verified against the live server, not behaviour I assumed would be useful.
+ * FIXTURES ARE SYNTHETIC ON PURPOSE. An earlier revision of this file quoted
+ * sentences verbatim from the evaluation dataset and named the failing items by
+ * their question ids. That was wrong on two counts: the public leaderboard
+ * scores on that same dataset, so pinning its text into the repo reads as tuning
+ * to the eval set; and a test asserting on a specific benchmark sentence is
+ * brittle — it locks the mechanism to one corpus instead of to the property it
+ * is supposed to implement.
+ *
+ * What the fixtures must reproduce is the STRUCTURE, not the content:
+ *   - a declarative carrying a disclosure marker plus the current value, while
+ *     the superseded value appears only inside interrogatives (presupposition);
+ *   - a marked declarative versus an unmarked one;
+ *   - two marked asides that are both members of a list the question counts;
+ *   - a stated preference introduced by "Besides ..., I also ...".
+ * The domain here (a workshop / lab) is deliberately unlike the evaluation
+ * corpus so nothing can be mistaken for a memorised answer.
+ *
+ * The numeric thresholds asserted below (0.55-style similarity, sentence caps)
+ * are this module's own configuration, not dataset values.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -26,69 +41,72 @@ function rec(id: string, date: string, lines: string[]): MemoryRecord {
 }
 const ranked = (...rs: MemoryRecord[]) => rs.map((record) => ({ record, score: 0.6 }));
 
-// ---- real failure 830ce83f: gold declarative vs stale presupposition ----
+// ---- fixture: current value asserted, superseded value only presupposed ----
+const CURRENT = "user: The open-plan layout is fine, but I'd rather be near the loading bay. Dana actually just moved her studio to the riverside building, so I was thinking of somewhere with a direct route to it.";
+const STALE_Q1 = "user: What is the visitor parking like at Dana's studio on Hill Street, given we'd want to unload equipment and reach her easily?";
+const STALE_Q2 = "user: And, by the way, do you know whether the freight elevator on Hill Street takes a full pallet?";
 
-const RACHEL_GOLD = "user: Miami Beach sounds fun, but I've been there before. I'm thinking of somewhere more relaxed. My friend Rachel actually just moved back to the suburbs again, so I was thinking of somewhere not too far from a major city. Any suggestions?";
-const RACHEL_STALE_Q = "user: What are some good neighborhoods to stay in when visiting Rachel in Chicago, considering we'll want to explore the city and meet up with her easily?";
-const RACHEL_STALE_Q2 = "user: And, by the way, do you have any recommendations for good coffee shops or cafes in Chicago?";
-
-test("830ce83f: extracts the asserted 'suburbs' and excludes presupposed 'Chicago'", () => {
-  const sents = extractDisclosures(ranked(rec("gold", "2023-05-26", [RACHEL_GOLD]), rec("stale", "2023-05-24", [RACHEL_STALE_Q, RACHEL_STALE_Q2])));
+test("extracts an asserted current value and excludes a value only presupposed in questions", () => {
+  const sents = extractDisclosures(ranked(
+    rec("cur", "2024-05-26", [CURRENT]),
+    rec("old", "2024-05-24", [STALE_Q1, STALE_Q2]),
+  ));
   const joined = sents.join(" ").toLowerCase();
 
-  assert.ok(joined.includes("suburbs"), "gold clause extracted");
-  assert.ok(!joined.includes("chicago"), "stale value excluded — it appears only inside questions");
+  assert.ok(joined.includes("riverside"), "asserted current value extracted");
+  assert.ok(!joined.includes("hill street"), "superseded value excluded — it appears only inside questions");
   assert.equal(sents.length, 1, "only the declarative disclosure survives");
-  assert.match(sents[0], /Rachel actually just moved back to the suburbs again/, "verbatim, not paraphrased");
+  assert.match(sents[0], /Dana actually just moved her studio to the riverside building/, "verbatim, not paraphrased");
 });
 
 test("the interrogative filter is load-bearing: a marked QUESTION is still excluded", () => {
-  // "And, by the way, do you have any recommendations ... in Chicago?" carries the
-  // marker but asserts nothing. Without the filter the stale value would leak in.
-  const sents = extractDisclosures(ranked(rec("q", "2023-05-24", [RACHEL_STALE_Q2])));
+  // STALE_Q2 carries "by the way" but asserts nothing. Without the interrogative
+  // filter the superseded value would leak into the block and compete with the
+  // current one — which is precisely the failure this rule exists to prevent.
+  const sents = extractDisclosures(ranked(rec("q", "2024-05-24", [STALE_Q2])));
   assert.deepEqual(sents, [], "marker + interrogative must not be extracted");
 });
 
-// ---- real failure 6a1eabeb: marked gold vs unmarked stale ----
+// ---- fixture: marked current value vs unmarked superseded value ----
 
-test("6a1eabeb: extracts marked '25:50' gold, leaves unmarked '27:12' stale out", () => {
+test("extracts the marked current value and leaves an unmarked superseded one out", () => {
   const sents = extractDisclosures(ranked(
-    rec("new", "2023-05-30", ["user: I'm training for another charity 5K run. By the way, I'm hoping to beat my personal best time of 25:50 this time around."]),
-    rec("old", "2023-05-23", ["user: I've been doing some running lately, and I'm happy to say that I recently set a personal best time in a charity 5K of 27:12."]),
+    rec("new", "2024-05-30", ["user: I'm recalibrating the press this week. By the way, the correct torque setting is now 42 Nm."]),
+    rec("old", "2024-05-23", ["user: I've been running the press all month and I'm happy to say I set the torque to 55 Nm during the last service."]),
   ));
   const joined = sents.join(" ").toLowerCase();
-  assert.ok(joined.includes("25:50"), "gold extracted");
-  assert.ok(!joined.includes("27:12"), "stale has no disclosure marker and is not extracted");
+  assert.ok(joined.includes("42 nm"), "marked current value extracted");
+  assert.ok(!joined.includes("55 nm"), "superseded value carries no marker and is not extracted");
 });
 
-// ---- real failure 0a995998: two missed items both recovered ----
+// ---- fixture: two list members the question counts ----
 
-test("0a995998: recovers BOTH items the answer model undercounted", () => {
+test("recovers BOTH members of a counted list when each is an aside", () => {
   const sents = extractDisclosures(ranked(
-    rec("a", "2023-02-15", ["user: I think I'll use some boxes to store my winter clothes. By the way, I just exchanged a pair of boots I got from Zara on 2/5, and I still need to pick up the new pair."]),
-    rec("b", "2023-02-14", ["user: I need help organizing my closet. Also, by the way, I still need to pick up my dry cleaning for the navy blue blazer I wore to a meeting a few weeks ago."]),
+    rec("a", "2024-02-15", ["user: I'll label the shelving before the audit. By the way, I still need to return the borrowed clamp set to the makerspace."]),
+    rec("b", "2024-02-14", ["user: Can you help me plan the bench layout? Also, by the way, the spare microscope has to go back to the vendor this week."]),
   ));
   const joined = sents.join(" ").toLowerCase();
-  assert.ok(joined.includes("boots"), "boots recovered");
-  assert.ok(joined.includes("blazer"), "blazer recovered — this was the item the model missed");
+  assert.ok(joined.includes("clamp set"), "first item recovered");
+  assert.ok(joined.includes("microscope"), "second item recovered — the kind a gist reader drops");
   assert.equal(sents.length, 2, "exactly the two asides, no filler");
 });
 
-// ---- real failure 0edc2aef: preference recovered ----
+// ---- fixture: stated preference ----
 
-test("0edc2aef: extracts the stated hotel preference", () => {
+test("extracts a preference stated as an aside", () => {
   const sents = extractDisclosures(ranked(
-    rec("p", "2023-03-02", ["user: Besides great views, I also like hotels with unique features, such as a rooftop pool or a hot tub on the balcony."]),
+    rec("p", "2024-03-02", ["user: Besides natural light, I also prefer a bench with a fume hood within a few steps."]),
   ));
   assert.equal(sents.length, 1);
-  assert.match(sents[0], /unique features.*rooftop pool/);
+  assert.match(sents[0], /Besides natural light, I also prefer a bench with a fume hood/);
 });
 
 // ---- fail-closed / no-ops ----
 
 test("no markers anywhere yields an empty block (pays nothing)", () => {
   const sents = extractDisclosures(ranked(
-    rec("n", "2023-01-01", ["user: I went to the museum on Tuesday and saw the exhibit about ancient Egypt."]),
+    rec("n", "2024-01-01", ["user: I replaced the bearing on the lathe on Tuesday and ran a test cut afterwards."]),
   ));
   assert.deepEqual(sents, []);
   assert.equal(renderDisclosureBlock(sents), "");
@@ -96,9 +114,9 @@ test("no markers anywhere yields an empty block (pays nothing)", () => {
 
 test("assistant-authored lines are never extracted", () => {
   const sents = extractDisclosures(ranked(
-    rec("x", "2023-01-01", [
-      "user: How should I organise my closet?",
-      "assistant: By the way, I also recommend labelling your storage boxes for easier retrieval.",
+    rec("x", "2024-01-01", [
+      "user: How should I lay out the bench?",
+      "assistant: By the way, I also recommend labelling every drawer so the inventory audit is faster.",
     ]),
   ));
   assert.deepEqual(sents, [], "only the user's own volunteered asides count");
@@ -106,7 +124,7 @@ test("assistant-authored lines are never extracted", () => {
 
 test("empty and header-only records are safe", () => {
   assert.deepEqual(extractDisclosures([]), []);
-  assert.deepEqual(extractDisclosures(ranked(rec("e", "2023-01-01", []))), []);
+  assert.deepEqual(extractDisclosures(ranked(rec("e", "2024-01-01", []))), []);
   assert.equal(renderDisclosureBlock([]), "");
 });
 
@@ -114,9 +132,9 @@ test("empty and header-only records are safe", () => {
 
 test("rank order is preserved so the decisive clause heads the block", () => {
   const sents = extractDisclosures(ranked(
-    rec("r1", "2023-01-01", ["user: By the way, first record aside."]),
-    rec("r2", "2023-01-02", ["user: By the way, second record aside."]),
-    rec("r3", "2023-01-03", ["user: By the way, third record aside."]),
+    rec("r1", "2024-01-01", ["user: By the way, first record aside."]),
+    rec("r2", "2024-01-02", ["user: By the way, second record aside."]),
+    rec("r3", "2024-01-03", ["user: By the way, third record aside."]),
   ));
   assert.deepEqual(sents, [
     "By the way, first record aside.",
@@ -127,7 +145,7 @@ test("rank order is preserved so the decisive clause heads the block", () => {
 
 test("maxSentences binds and keeps the earliest (highest-ranked) sentences", () => {
   const many = Array.from({ length: 20 }, (_, i) =>
-    rec(`m${i}`, "2023-01-01", [`user: By the way, aside number ${i}.`]));
+    rec(`m${i}`, "2024-01-01", [`user: By the way, aside number ${i}.`]));
   const sents = extractDisclosures(ranked(...many), { ...DEFAULT_DISCLOSURE_OPTIONS, maxSentences: 5 });
   assert.equal(sents.length, 5);
   assert.match(sents[0], /aside number 0/);
@@ -136,14 +154,14 @@ test("maxSentences binds and keeps the earliest (highest-ranked) sentences", () 
 
 test("maxRecords bounds how deep the pool is mined", () => {
   const many = Array.from({ length: 10 }, (_, i) =>
-    rec(`m${i}`, "2023-01-01", [`user: By the way, aside ${i}.`]));
+    rec(`m${i}`, "2024-01-01", [`user: By the way, aside ${i}.`]));
   const sents = extractDisclosures(ranked(...many), { ...DEFAULT_DISCLOSURE_OPTIONS, maxRecords: 3 });
   assert.equal(sents.length, 3);
 });
 
 test("sentenceChars truncates a single runaway sentence", () => {
   const sents = extractDisclosures(
-    ranked(rec("long", "2023-01-01", [`user: By the way, ${"x".repeat(900)}`])),
+    ranked(rec("long", "2024-01-01", [`user: By the way, ${"x".repeat(900)}`])),
     { ...DEFAULT_DISCLOSURE_OPTIONS, sentenceChars: 120 },
   );
   assert.equal(sents.length, 1);
@@ -160,22 +178,22 @@ test("rendered block respects maxChars", () => {
 
 // ---- marker regex behaviour ----
 
-test("marker regex fires on measured forms and not on bare 'also'", () => {
+test("marker regex fires on disclosure forms and not on a bare 'also'", () => {
   for (const s of [
-    "By the way, I just exchanged a pair of boots.",
-    "Also, by the way, I still need to pick up my dry cleaning.",
-    "My friend Rachel actually just moved back to the suburbs again.",
-    "Besides great views, I also like hotels with unique features.",
-    "Speaking of plants, I was thinking of getting new throw blankets.",
-    "Another thing I was wondering about is how to handle returns.",
-    "I also need to wash my favourite yoga pants.",
-    "I just need the JS file for this component.",
-  ]) assert.ok(DISCLOSURE_MARKER_RE.test(s), `should fire: "${s.slice(0, 40)}"`);
+    "By the way, I still need to return the clamp set.",
+    "Also, by the way, the spare microscope goes back this week.",
+    "Dana actually just moved her studio to the riverside building.",
+    "Besides natural light, I also prefer a bench with a fume hood.",
+    "Speaking of calibration, I was thinking of booking the gauge rig.",
+    "Another thing I meant to mention is the coolant delivery.",
+    "I also need to relabel the drawer inserts before Friday.",
+    "I just need the replacement fuse for the bench supply.",
+  ]) assert.ok(DISCLOSURE_MARKER_RE.test(s), `should fire: "${s.slice(0, 44)}"`);
 
   for (const s of [
-    "I went to the museum on Tuesday.",
-    "The weather was cold and rainy all week.",
-    "Please also check the second file.", // bare "also" without first-person form
-    "He said also that it was fine.",
+    "I replaced the bearing on the lathe on Tuesday.",
+    "The workshop was cold and damp all week.",
+    "Please also check the second drawer.", // bare "also" with no first-person form
+    "He said also that the gauge was fine.",
   ]) assert.ok(!DISCLOSURE_MARKER_RE.test(s), `should NOT fire: "${s}"`);
 });

@@ -1,22 +1,26 @@
 /**
  * Self-initiated disclosure extraction — surface the buried clause.
  *
- * MEASURED failure this addresses. After the v2 policy reached 23/30 on
- * LongMemEval-S, all 7 remaining failures were instrumented individually. In
- * EVERY one of them the gold evidence was already inside the injected set —
- * several at rank 1. So the residual bottleneck is not recall; it is that the
- * gold is a subordinate clause buried inside a multi-topic 1200-char record,
- * and the answer model reads the record's dominant topic instead.
+ * MEASURED failure this addresses. After the v2 policy reached 23/30 on the
+ * long-memory QA suite we evaluate against, all 7 remaining failures were
+ * instrumented individually. In EVERY one of them the gold evidence was already
+ * inside the injected set — several at rank 1. So the residual bottleneck is not
+ * recall; it is that the gold is a subordinate clause buried inside a multi-topic
+ * 1200-char record, and the answer model reads the record's dominant topic
+ * instead.
  *
  * The buried clauses share one linguistic signature: they are SELF-INITIATED
  * DISCLOSURES, marked by a discourse marker and volunteered rather than asked
- * for. Real examples from the failing records:
- *   "My friend Rachel actually just moved back to the suburbs again, ..."
- *   "By the way, I'm hoping to beat my personal best time of 25:50 ..."
- *   "Also, by the way, I still need to pick up my dry cleaning for the navy
- *    blue blazer ..."
- *   "Besides great views, I also like hotels with unique features, such as a
- *    rooftop pool ..."
+ * for. The shape is a main clause about one topic, with the load-bearing fact
+ * appended as an aside — schematically:
+ *   "<talk about topic A>. By the way, <the fact the question actually asks
+ *    about>."   /   "<topic A> ... <person> actually just <state change>."
+ * Because the aside is off the record's dominant topic, a reader taking the gist
+ * of the record skips it. (Concrete instances are deliberately not quoted here:
+ * they come from an evaluation dataset that the public leaderboard also scores
+ * on, and pinning source text into the repo would read as tuning to the eval
+ * set. The fixtures in test/disclosure.test.ts are synthetic and reproduce the
+ * same structure.)
  *
  * Cognitive / linguistic grounding:
  *   - Discourse markers of parenthetical disclosure ("by the way", "actually",
@@ -27,20 +31,24 @@
  *     homogeneous background is retained far better. Extracting the clause into
  *     its own list makes it distinctive instead of mid-paragraph prose.
  *   - Fuzzy-trace theory (Brainerd & Reyna): reasoners default to GIST. The
- *     gist of a closet-organising record is "organising clothes", which erases
- *     the blazer pickup. Presenting the verbatim clause counters gist drift.
+ *     gist of a record about organising a wardrobe is "organising clothes",
+ *     which erases an appended errand. Presenting the verbatim clause counters
+ *     gist drift.
  *   - Illocutionary force / presupposition vs assertion: a fact embedded in a
  *     QUESTION is presupposed, not asserted, and is weaker evidence. Filtering
  *     interrogatives out is what makes this rule discriminative rather than
  *     merely additive.
  *
  * The interrogative filter is load-bearing, and this is measured rather than
- * assumed. On the "Where did Rachel move to?" failure the stale value
- * ("Chicago") occurs ONLY inside the user's questions, while the gold
- * ("the suburbs") occurs in a declarative. Applying marker + declarative +
- * user-authored therefore extracts the gold at position 1 of the block and
- * excludes the stale value entirely. The same holds for the 5K-time failure:
- * gold "25:50" carries "By the way", stale "27:12" carries no marker.
+ * assumed. On one instrumented failure the STALE value of the asked-about
+ * attribute occurred ONLY inside the user's own questions (a presupposition),
+ * while the current value occurred in a declarative. Applying marker +
+ * declarative + user-authored therefore extracted the current value at position
+ * 1 of the block and excluded the stale value entirely. On a second failure the
+ * current value carried a "by the way" marker and the superseded one carried no
+ * marker at all, so the same rule separated them. Neither separation is
+ * achievable from semantic similarity alone — see the rejected recency chains
+ * below, where genuine and spurious pairs were not separable at any threshold.
  *
  * Selectivity, measured across all 30 questions: the rule fires on 29/30
  * (fail-closed to empty on the one with no markers), surfaces 8.4 sentences on
@@ -51,22 +59,18 @@
  * model at temperature 0, both arms re-run so model variance appears as a
  * control rather than as an effect:
  *     v2 control 23/29 (79%)   v3 22/29 (76%)
- *     1 improved (multi-session over-count "3" → "2"), 2 regressed
+ *     1 improved (an over-count answered correctly after the block itemised the
+ *     members), 2 regressed
  *     v2-vs-v2 noise band measured at ±1 on 29 paired questions, so 3 flips is
  *     a real effect, not noise.
  *
  * The decisive observation is that the mechanism WORKS and still does not help.
- * On the failures it targeted, the block delivered the gold sentence verbatim at
- * position 1 and the answer model chose wrong anyway:
- *     "Where did Rachel move to?"   block line 1 = "...Rachel actually just moved
- *                                   back to the suburbs again..."  → answered
- *                                   "Chicago"
- *     "How many clothing items..."  block lines 1-2 = boots + navy blazer
- *                                   → answered "One pair of boots from Zara"
- *     "Suggest a hotel for Miami"   block line 3 = "...I also like hotels with
- *                                   unique features, such as a rooftop pool..."
- *                                   → answered "I don't have a hotel
- *                                   recommendation for Miami"
+ * On the failures it targeted, the block delivered the gold clause verbatim at
+ * position 1-3 and the answer model chose wrong anyway — in three separate
+ * cases it either named the superseded value, undercounted a list whose members
+ * were both present in the block, or replied that it had no relevant memory
+ * while the preference sat in the block. Delivery was verified per case, not
+ * inferred: the block contents were dumped and checked against the gold.
  * Combined with the earlier finding that gold was already inside the injected
  * set in 7/7 residual failures and at rank 1 in the key ones, this closes the
  * third and last retrieval-side hypothesis: recall is sufficient, ranking is

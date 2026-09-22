@@ -70,7 +70,7 @@ test("aggregation gets the largest budget, default the smallest", () => {
 // ---- user char share ----
 
 test("userCharShare measures the user-authored fraction", () => {
-  const allUser = "[2023-02-15] (session s1)\nuser: I bought a red jacket from Zara.";
+  const allUser = "[2023-02-15] (session s1)\nuser: I bought a new bench lamp at the hardware store.";
   const allAssistant = "[2023-02-15] (session s1)\nassistant: Here are some tips for you.";
   assert.ok(userCharShare(allUser) > 0.9, "user-only record is ~1.0");
   assert.ok(userCharShare(allAssistant) < 0.1, "assistant-only record is ~0.0");
@@ -79,7 +79,7 @@ test("userCharShare measures the user-authored fraction", () => {
 test("userCharShare splits mixed-role records by line attribution", () => {
   const mixed = [
     "[2023-02-15] (session s1)",
-    "user: I need to return these boots.",        // 29 chars
+    "user: I need to return these tools.",        // 29 chars
     "assistant: Sure, here is a long explanation that goes on and on and on.", // ~70 chars
   ].join("\n");
   const share = userCharShare(mixed);
