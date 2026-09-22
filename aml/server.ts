@@ -16,7 +16,6 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { buildPersona, renderPersona } from "../src/service/persona.ts";
 import { buildCountingAid } from "../src/service/counting-aid.ts";
 import { classifyQuestion, budgetForClass, selfReferenceFactor } from "../src/service/retrieval-policy.ts";
-import { buildRecencyChains, renderRecencyBlock, semanticSimilarityFromVecs } from "../src/service/recency.ts";
 import { MemoryStore, recordId } from "../src/core/store.ts";
 import { rankForContext } from "../src/core/ranker.ts";
 import { encodeWithCache, poolChunkScores, type EmbedGateway } from "../src/adapters/embed.ts";
@@ -36,14 +35,14 @@ const TOP_K = Number(process.env.AML_TOP_K ?? 100);
  * Retrieval policy switch for A/B measurement.
  *   v1 = fixed 8000-char budget, no dedup, no self-reference weighting (baseline)
  *   v2 = adaptive budget by question class + dedup + self-reference weighting
- *   v3 = v2 + semantic recency chains that label the CURRENT value when an
- *        attribute was updated (targets the measured knowledge-update failures)
- * AML never sends this; the default comes from AML_POLICY. The POST /policy
- * endpoint flips it at runtime so every arm can be measured against identical,
- * freshly-ingested data.
+ * AML never sends this; the default is v2 (measured 23/30 on LongMemEval-S).
+ * The POST /policy endpoint flips it at runtime so both arms can be measured
+ * against identical, freshly-ingested data.
+ *
+ * A v3 arm (semantic recency chains) was implemented and REJECTED by
+ * measurement — see docs/invalid-mechanisms.md.
  */
-let ACTIVE_POLICY: "v1" | "v2" | "v3" =
-  process.env.AML_POLICY === "v1" ? "v1" : process.env.AML_POLICY === "v2" ? "v2" : "v3";
+let ACTIVE_POLICY: "v1" | "v2" = (process.env.AML_POLICY === "v1" ? "v1" : "v2");
 
 // ---- lazy embed gateway (local ONNX or remote xfyun, configured via env) ----
 // PI_MEMORY_EMBED_SOURCE=local (default, ONNX) | xfyun (remote API, needs key)
@@ -188,9 +187,6 @@ async function searchPipeline(
   // about commute duration. Cognitive basis: human associative memory retrieves
   // by meaning, not keyword match (spreading activation, Collins & Loftus 1975).
   let semanticScores: Map<string, number> | undefined;
-  // Chunk vectors are retained (not just their pooled query scores) so v3 can
-  // compute RECORD-to-RECORD similarity for update-chain detection.
-  let chunkVecs: Map<string, Float32Array> | undefined;
   const gw = await getEmbed();
   console.error(`[DEBUG] embed gw=${gw ? 'loaded' : 'null'}`);
   if (gw && pool.length) {
@@ -202,7 +198,6 @@ async function searchPipeline(
         const vecs = await encodeWithCache(scope.store, userId, pool, gw);
         const qv = await gw.encodeQuery(query);
         semanticScores = poolChunkScores(vecs, qv);
-        chunkVecs = vecs;
         console.error(`[DEBUG] semantic ok: ${semanticScores?.size ?? 0} entries (full pool)`);
         break;
       } catch (e) {
@@ -259,23 +254,6 @@ async function searchPipeline(
   const finalRanked = DIVERSITY > 0 ? sessionDiversityRerank(ranked, DIVERSITY) : ranked;
 
   const results: Array<{ id: string; content: string; score: number; created_at: string }> = [];
-
-  // v3: semantic recency chains. Placed FIRST because for an updated attribute
-  // it directly resolves which competing value answers the question — measured
-  // failure mode: gold and stale were both retrieved (gold at rank 1) and the
-  // answer model still picked the stale one. Fail-closed when vectors are absent.
-  if (policy === "v3" && chunkVecs) {
-    try {
-      const chains = buildRecencyChains(ranked, semanticSimilarityFromVecs(chunkVecs));
-      const block = renderRecencyBlock(chains);
-      if (block) {
-        results.push({ id: "recency_chains", content: block, score: 0.9995, created_at: new Date().toISOString() });
-        console.error(`[DEBUG] recency chains=${chains.length} blockChars=${block.length}`);
-      }
-    } catch (e) {
-      console.error(`[DEBUG] recency FAIL: ${(e as Error).message?.slice(0, 100)}`);
-    }
-  }
 
   // Persona injection: deterministic user profile from topic frequency.
   // Fail-closed: persona construction must never break the search.
@@ -545,14 +523,14 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     if (req.method === "POST") {
       try {
         const p = JSON.parse(body) as { policy?: string };
-        if (p.policy === "v1" || p.policy === "v2" || p.policy === "v3") {
+        if (p.policy === "v1" || p.policy === "v2") {
           ACTIVE_POLICY = p.policy;
           console.log(`[POLICY] switched to ${ACTIVE_POLICY}`);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ policy: ACTIVE_POLICY }));
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "policy must be 'v1', 'v2' or 'v3'" }));
+          res.end(JSON.stringify({ error: "policy must be 'v1' or 'v2'" }));
         }
       } catch (e) {
         res.writeHead(400, { "Content-Type": "application/json" });
