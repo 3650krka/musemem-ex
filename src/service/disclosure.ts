@@ -46,6 +46,40 @@
  * (fail-closed to empty on the one with no markers), surfaces 8.4 sentences on
  * average, max 1664 chars. It flags only 3-4% of the sentences in a pool.
  *
+ * END-TO-END RESULT: net −1, so this ships opt-in (arm v3) and defaults OFF.
+ * A controlled A/B was run on byte-identical stores, same questions, same answer
+ * model at temperature 0, both arms re-run so model variance appears as a
+ * control rather than as an effect:
+ *     v2 control 23/29 (79%)   v3 22/29 (76%)
+ *     1 improved (multi-session over-count "3" → "2"), 2 regressed
+ *     v2-vs-v2 noise band measured at ±1 on 29 paired questions, so 3 flips is
+ *     a real effect, not noise.
+ *
+ * The decisive observation is that the mechanism WORKS and still does not help.
+ * On the failures it targeted, the block delivered the gold sentence verbatim at
+ * position 1 and the answer model chose wrong anyway:
+ *     "Where did Rachel move to?"   block line 1 = "...Rachel actually just moved
+ *                                   back to the suburbs again..."  → answered
+ *                                   "Chicago"
+ *     "How many clothing items..."  block lines 1-2 = boots + navy blazer
+ *                                   → answered "One pair of boots from Zara"
+ *     "Suggest a hotel for Miami"   block line 3 = "...I also like hotels with
+ *                                   unique features, such as a rooftop pool..."
+ *                                   → answered "I don't have a hotel
+ *                                   recommendation for Miami"
+ * Combined with the earlier finding that gold was already inside the injected
+ * set in 7/7 residual failures and at rank 1 in the key ones, this closes the
+ * third and last retrieval-side hypothesis: recall is sufficient, ranking is
+ * sufficient, and verbatim salience promotion is sufficient. The residual
+ * bottleneck is the answer model's reasoning over supplied evidence, which is
+ * not a memory-system property.
+ *
+ * Retained rather than deleted because the failure mode differs from the
+ * rejected recency chains below: that mechanism's TRIGGER CRITERION was
+ * falsified (it could never select correctly), whereas this one demonstrably
+ * does what it was designed to do and is simply not load-bearing for this
+ * answer model. It may become useful with a stronger one.
+ *
  * Rejected predecessor: a semantic "recency chain" that tried to mark the newer
  * of two co-retrieved values as CURRENT. Falsified — genuine update pairs sit at
  * cosine 0.53 while same-day parallel duplicates reach 0.96 and topic drift

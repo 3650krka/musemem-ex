@@ -38,11 +38,13 @@ const TOP_K = Number(process.env.AML_TOP_K ?? 100);
  *   v2 = adaptive budget by question class + dedup + self-reference weighting
  * AML never sends this; the default is v2 (measured 23/30 on LongMemEval-S).
  * The POST /policy endpoint flips it at runtime so every arm can be measured
- * against identical, freshly-ingested data. v3 stays opt-in via that endpoint
- * until it has been measured end to end.
+ * against identical, freshly-ingested data.
  *
- * A previous v3 arm (semantic recency chains) was implemented and REJECTED by
- * measurement — see docs/invalid-mechanisms.md.
+ * v3 adds the "volunteered asides" block and is OPT-IN ONLY: a controlled A/B on
+ * byte-identical stores measured v2 23/29 vs v3 22/29 against a ±1 noise band,
+ * i.e. a real net −1. See src/service/disclosure.ts and
+ * docs/invalid-mechanisms.md. A previous v3 arm (semantic recency chains) was
+ * rejected outright — its trigger criterion was falsified.
  */
 let ACTIVE_POLICY: "v1" | "v2" | "v3" =
   process.env.AML_POLICY === "v1" ? "v1" : process.env.AML_POLICY === "v3" ? "v3" : "v2";
@@ -531,7 +533,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   }
 
   // ---- POLICY (auth-protected diagnostic switch) ----
-  // POST /policy {"policy":"v1"|"v2"} — flips the retrieval policy at runtime
+  // POST /policy {"policy":"v1"|"v2"|"v3"} — flips the retrieval policy at runtime
   // so A/B arms can be measured on identical data without a redeploy.
   if (path === "/policy") {
     if (req.method === "GET") {
