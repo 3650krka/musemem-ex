@@ -111,6 +111,21 @@ function policyFromEnv(v: string | undefined): Policy {
 }
 let ACTIVE_POLICY: Policy = policyFromEnv(process.env.AML_POLICY);
 
+/**
+ * Runtime override for the corroboration-blend strength (ranker.ts: the knob in
+ * max(lexical, semantic) + w·min(lexical, semantic)). null = use the provider's
+ * calibrated value from retrieval-params.ts. Mirrors the /policy pattern so an
+ * A/B can sweep the weight at runtime on identical data without a redeploy —
+ * needed because the dose that is optimal for recall (grid: monotone up to 0.9+)
+ * must be validated end-to-end before the calibration table is rewritten.
+ * Initial value may be pinned via AML_SEMANTIC_WEIGHT.
+ */
+const envWeight = Number(process.env.AML_SEMANTIC_WEIGHT ?? NaN);
+let ACTIVE_WEIGHT_OVERRIDE: number | null = Number.isFinite(envWeight) && envWeight >= 0 ? envWeight : null;
+function effectiveSemanticWeight(): number {
+  return ACTIVE_WEIGHT_OVERRIDE ?? retrievalParamsFor(embedProvider).semanticWeight;
+}
+
 // ---- lazy embed gateway (local ONNX or remote xfyun, configured via env) ----
 // PI_MEMORY_EMBED_SOURCE=local (default, ONNX) | xfyun (remote API, needs key)
 let embedGw: EmbedGateway | null = null;
@@ -307,9 +322,10 @@ async function searchPipeline(
       level0Pct: DEFAULT_CONFIG.level0Pct,
       level1Pct: DEFAULT_CONFIG.level1Pct,
       semanticScores,
-      // The weight must come from the provider that actually produced these
-      // vectors, not from a literal. See embedProvider.
-      semanticWeight: semanticScores ? retrievalParamsFor(embedProvider).semanticWeight : 0,
+      // The weight comes from the provider that produced these vectors, or from
+      // the runtime override when an A/B has pinned one. See embedProvider and
+      // ACTIVE_WEIGHT_OVERRIDE.
+      semanticWeight: semanticScores ? effectiveSemanticWeight() : 0,
       // AML is a retrieval benchmark: relevance matters more than in the
       // live system, but temporal context still helps. Balanced weights:
       // overlap 0.6 (up from default 0.45), temporal 0.4 (down from 0.55).
@@ -655,26 +671,46 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   }
 
   // ---- POLICY (auth-protected diagnostic switch) ----
-  // POST /policy {"policy":"v1"|"v2"|"v3"|"v4"} — flips the retrieval policy at
-  // runtime so A/B arms can be measured on identical data without a redeploy.
+  // POST /policy {"policy":"v1".."v6", "semanticWeight"?: number|null}
+  // Flips the retrieval policy and/or pins the corroboration weight at runtime
+  // so A/B arms can be measured on identical data without a redeploy.
   if (path === "/policy") {
     if (req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ policy: ACTIVE_POLICY }));
+      res.end(JSON.stringify({
+        policy: ACTIVE_POLICY,
+        semanticWeight: ACTIVE_WEIGHT_OVERRIDE ?? "provider-calibrated",
+      }));
       return;
     }
     if (req.method === "POST") {
       try {
-        const p = JSON.parse(body) as { policy?: string };
+        const p = JSON.parse(body) as { policy?: string; semanticWeight?: number | null };
         if (p.policy !== undefined && (KNOWN_POLICIES as readonly string[]).includes(p.policy)) {
           ACTIVE_POLICY = p.policy as Policy;
           console.log(`[POLICY] switched to ${ACTIVE_POLICY}`);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ policy: ACTIVE_POLICY }));
-        } else {
+        } else if (p.policy !== undefined) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: `policy must be one of ${KNOWN_POLICIES.join(", ")}` }));
+          return;
         }
+        if ("semanticWeight" in p) {
+          if (p.semanticWeight === null) {
+            ACTIVE_WEIGHT_OVERRIDE = null;
+          } else if (typeof p.semanticWeight === "number" && Number.isFinite(p.semanticWeight) && p.semanticWeight >= 0) {
+            ACTIVE_WEIGHT_OVERRIDE = p.semanticWeight;
+          } else {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "semanticWeight must be a finite number >= 0, or null to clear" }));
+            return;
+          }
+          console.log(`[POLICY] semanticWeight override → ${ACTIVE_WEIGHT_OVERRIDE ?? "provider-calibrated"}`);
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          policy: ACTIVE_POLICY,
+          semanticWeight: ACTIVE_WEIGHT_OVERRIDE ?? "provider-calibrated",
+        }));
       } catch (e) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: (e as Error).message }));
