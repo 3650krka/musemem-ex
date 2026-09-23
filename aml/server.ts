@@ -115,6 +115,22 @@ let ACTIVE_POLICY: Policy = policyFromEnv(process.env.AML_POLICY);
 // PI_MEMORY_EMBED_SOURCE=local (default, ONNX) | xfyun (remote API, needs key)
 let embedGw: EmbedGateway | null = null;
 let embedFailed = false;
+/**
+ * Which provider actually produced the live gateway. Tracked because the ranking
+ * parameters are a FUNCTION OF THE PROVIDER: retrieval-params.ts calibrates
+ * semanticWeight per embedding space and records that the two spaces need
+ * OPPOSITE blend weights (local 0.6B semantic-heavy 0.75, xfyun 8B lexical-heavy
+ * 0.45), so "a single constant is provably wrong for both".
+ *
+ * This used to be inferred at the ranking call site, where it was hardcoded to
+ * "local" — meaning an xfyun-backed deployment ranked with the local model's
+ * 0.75 instead of its calibrated 0.45, a 0.30 error on the dominant ranking
+ * lever. Every other call site (src/index.ts, both bench harnesses) already
+ * passed the live provider; only the leaderboard-facing server did not. The
+ * resolved provider is now recorded here and reported on /health so a mismatch
+ * is observable instead of silent.
+ */
+let embedProvider: "local" | "xfyun" = "local";
 async function getEmbed(): Promise<EmbedGateway | null> {
   if (embedGw || embedFailed) return embedGw;
   const source = (process.env.PI_MEMORY_EMBED_SOURCE ?? "local").trim();
@@ -132,14 +148,21 @@ async function getEmbed(): Promise<EmbedGateway | null> {
       if (!key) { console.log("[AML] xfyun key not found, falling back to local"); }
       else {
         embedGw = createRemoteEmbedGateway("xfyun", key);
-        if (embedGw) { console.log(`[AML] embed gateway: xfyun (dim=${embedGw.dim})`); return embedGw; }
+        if (embedGw) {
+          embedProvider = "xfyun";
+          const p = retrievalParamsFor(embedProvider);
+          console.log(`[AML] embed gateway: xfyun (dim=${embedGw.dim}) semanticWeight=${p.semanticWeight}`);
+          return embedGw;
+        }
       }
     }
     // Default: local ONNX
     const { createEmbedGateway } = await import("../src/adapters/embed.ts");
     embedGw = await createEmbedGateway();
-    if (embedGw) console.log(`[AML] embed gateway: local ONNX (dim=${embedGw.dim})`);
-    else { embedFailed = true; console.log("[AML] embed gateway unavailable"); }
+    if (embedGw) {
+      embedProvider = "local";
+      console.log(`[AML] embed gateway: local ONNX (dim=${embedGw.dim}) semanticWeight=${retrievalParamsFor(embedProvider).semanticWeight}`);
+    } else { embedFailed = true; console.log("[AML] embed gateway unavailable"); }
   } catch (e) {
     console.log("[AML] embed gateway failed:", (e as Error).message.slice(0, 100));
     embedFailed = true;
@@ -284,7 +307,9 @@ async function searchPipeline(
       level0Pct: DEFAULT_CONFIG.level0Pct,
       level1Pct: DEFAULT_CONFIG.level1Pct,
       semanticScores,
-      semanticWeight: semanticScores ? retrievalParamsFor("local").semanticWeight : 0,
+      // The weight must come from the provider that actually produced these
+      // vectors, not from a literal. See embedProvider.
+      semanticWeight: semanticScores ? retrievalParamsFor(embedProvider).semanticWeight : 0,
       // AML is a retrieval benchmark: relevance matters more than in the
       // live system, but temporal context still helps. Balanced weights:
       // overlap 0.6 (up from default 0.45), temporal 0.4 (down from 0.55).
@@ -484,8 +509,25 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 
   // health (unauthenticated)
   if (path === "/health" && req.method === "GET") {
+    // Provider identity is reported here because the ranking parameters are a
+    // function of it: an xfyun deployment ranked with the local model's blend
+    // weight is silently mis-calibrated, and nothing else on the wire reveals
+    // which space the vectors came from. No secrets are exposed — only the
+    // provider name, vector dimension and the calibrated weight in use.
+    const p = retrievalParamsFor(embedProvider);
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "healthy", stores: scopes.size }));
+    res.end(JSON.stringify({
+      status: "healthy",
+      stores: scopes.size,
+      embed: {
+        provider: embedGw ? embedProvider : (embedFailed ? "unavailable" : "not-initialized"),
+        dim: embedGw?.dim ?? null,
+        semanticWeight: p.semanticWeight,
+        activationThreshold: p.activationThreshold,
+        topK: p.topK,
+      },
+      policy: ACTIVE_POLICY,
+    }));
     return;
   }
 

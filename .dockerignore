@@ -1,0 +1,63 @@
+# Docker build context exclusions.
+#
+# WHY THIS FILE EXISTS. The Dockerfile does `COPY aml/ ./aml/`. Several files in
+# aml/ are local A/B harnesses that embed a live answer-model API key and a local
+# SOCKS proxy address. They are gitignored, so a build from a public GitHub clone
+# never sees them — but a build from a working checkout would bake the key into an
+# image layer, where it survives even if a later layer deletes the file. This list
+# makes the image safe to build from either context.
+#
+# Rule of thumb: anything that is not needed to serve POST /add and POST /search
+# stays out of the image.
+
+# Credentials and local provider config — never image material.
+.pi-memory/
+embed-provider.json
+models.json
+.env
+.env.*
+*.key
+*.pem
+
+# Local A/B harnesses, validators and their outputs (embed keys + benchmark answers).
+aml/ab-*.ts
+aml/test-multi.ts
+aml/bench-local.ts
+aml/run-validation.*
+aml/results-*
+aml/*.log
+aml/*.jsonl
+aml/*.cmd
+aml/*.ps1
+validation.pid
+temporal-ab.flag
+tl-harm.flag
+
+# Benchmarks, corpora and internal analysis — large and not part of the service.
+bench/
+prd/
+docs/
+architecture/
+test/
+AGENTS.md
+
+# Large local embedding models and caches.
+models/
+*.onnx
+
+# Dependencies and VCS — the image installs deps itself.
+node_modules/
+.git/
+.gitignore
+.github/
+
+# Build output and OS/IDE noise.
+dist/
+build/
+tmp/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+Dockerfile
+.dockerignore
