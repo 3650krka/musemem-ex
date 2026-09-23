@@ -62,18 +62,24 @@ const TOP_K = Number(process.env.AML_TOP_K ?? 100);
  * full breakdown and the untested question-class-conditional variant it suggests.
  *
  * v5 / v6 = the same mechanism at cap 2 and cap 3, forming a dose series with v4.
- * The uncapped arms naturally deliver 2.79 chunks per trace, so cap 1 (v4) is the
- * extreme end and cap 2 is the untested midpoint. These arms exist to map the
- * dose-response curve: if accuracy recovers monotonically with the cap while
- * coverage still improves over v2, there is a setting that buys the returnSize
- * tier without paying in taskSolve. If accuracy stays flat across caps, then
- * within-session redundancy is payload at every degree and the whole direction
- * is closed. A question-class-conditional variant was considered and rejected —
- * see TRACE_PER_BY_POLICY. NOTE the classifier check that killed it: the
- * regressing question type is classified assistant-content by the benchmark, but
- * classifyQuestion() returns assistant-content for 0 of those 5 questions (they
- * read as first-person and match PERSONAL_FACT_RE first), so a conditional keyed
- * on that class would have been dead code and its null result uninformative.
+ * MEASURED, and the series closes the direction rather than tuning it. Accuracy
+ * recovers monotonically with the cap while the returnSize saving vanishes
+ * monotonically with it:
+ *     cap 1 (v4)  chunks/trace 1.00  traces 34.2  chars 21,512  15/30  net −6 REAL
+ *     cap 2 (v5)  chunks/trace 1.69  traces 26.9  chars 24,218  19/30  net −2 noise
+ *     cap 3 (v6)  chunks/trace 2.17  traces 23.3  chars 24,324  21/30  net  0 noise
+ *     uncapped    chunks/trace 2.79  traces 17.4  chars 24,935  21/30  (control)
+ * The cause is measured: cap 1 leaves 8 of 30 questions pool-exhausted (emitted
+ * chars below 0.75× the class budget) versus 3 of 30 uncapped. Capping shrinks the
+ * payload only by starving the pool below its budget, which is the same act that
+ * removes the evidence the answer model uses. Caps 2-3 still fill the budget, so
+ * they save 2-3% — not enough to move a cost tier — and cost nothing measurable.
+ * Note for anyone reading the board: since the uncapped arms already emit 0.91 of
+ * their char budget, returnSize here is essentially budgetForClass() by another
+ * name, and that budget is what buys taskSolve. A question-class-conditional
+ * variant was considered and rejected before being built — see TRACE_PER_BY_POLICY.
+ * Full argument, per-type decomposition and the classifier check that killed the
+ * conditional are in src/service/trace-select.ts.
  */
 const KNOWN_POLICIES = ["v1", "v2", "v3", "v4", "v5", "v6"] as const;
 type Policy = (typeof KNOWN_POLICIES)[number];
