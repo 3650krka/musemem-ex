@@ -17,6 +17,7 @@ import { buildPersona, renderPersona } from "../src/service/persona.ts";
 import { buildCountingAid } from "../src/service/counting-aid.ts";
 import { classifyQuestion, budgetForClass, selfReferenceFactor } from "../src/service/retrieval-policy.ts";
 import { extractDisclosures, renderDisclosureBlock } from "../src/service/disclosure.ts";
+import { selectPerTrace, traceStats } from "../src/service/trace-select.ts";
 import { MemoryStore, recordId } from "../src/core/store.ts";
 import { rankForContext } from "../src/core/ranker.ts";
 import { encodeWithCache, poolChunkScores, type EmbedGateway } from "../src/adapters/embed.ts";
@@ -45,9 +46,22 @@ const TOP_K = Number(process.env.AML_TOP_K ?? 100);
  * i.e. a real net −1. See src/service/disclosure.ts and
  * docs/invalid-mechanisms.md. A previous v3 arm (semantic recency chains) was
  * rejected outright — its trigger criterion was falsified.
+ *
+ * v4 = v2 plus trace-level selection (one best chunk per originating session)
+ * and is likewise OPT-IN ONLY, pending an end-to-end measurement. It trades
+ * within-trace redundancy for distinct-trace coverage, which improves the
+ * retrieval metrics and shrinks returnSize — but returnSize is a COST TIER on
+ * the board while taskSolve is the SCORE, and retrieval-params.ts already
+ * records that removing redundancy cost −10..11pp end-to-end. So v4 must be
+ * validated on taskSolve before it can default on. See
+ * src/service/trace-select.ts for the full argument and the measured ratios.
  */
-let ACTIVE_POLICY: "v1" | "v2" | "v3" =
-  process.env.AML_POLICY === "v1" ? "v1" : process.env.AML_POLICY === "v3" ? "v3" : "v2";
+const KNOWN_POLICIES = ["v1", "v2", "v3", "v4"] as const;
+type Policy = (typeof KNOWN_POLICIES)[number];
+function policyFromEnv(v: string | undefined): Policy {
+  return (KNOWN_POLICIES as readonly string[]).includes(v ?? "") ? (v as Policy) : "v2";
+}
+let ACTIVE_POLICY: Policy = policyFromEnv(process.env.AML_POLICY);
 
 // ---- lazy embed gateway (local ONNX or remote xfyun, configured via env) ----
 // PI_MEMORY_EMBED_SOURCE=local (default, ONNX) | xfyun (remote API, needs key)
@@ -256,7 +270,23 @@ async function searchPipeline(
 
   // Session-diversity reranking (opt-in via AML_SESSION_DIVERSITY, 0=off).
   const DIVERSITY = Number(process.env.AML_SESSION_DIVERSITY ?? 0);
-  const finalRanked = DIVERSITY > 0 ? sessionDiversityRerank(ranked, DIVERSITY) : ranked;
+  const diverseRanked = DIVERSITY > 0 ? sessionDiversityRerank(ranked, DIVERSITY) : ranked;
+
+  // v4: trace-level selection. Applied AFTER ranking and BEFORE the budget loop,
+  // so the character budget is spent on distinct episodes rather than on several
+  // chunks of the same one. Fail-open: records whose session cannot be resolved
+  // are kept. perTrace is overridable so the redundancy/coverage trade can be
+  // swept instead of assumed to be optimal at 1.
+  const perTrace = Number(process.env.AML_TRACE_PER ?? 1);
+  const finalRanked = policy === "v4" ? selectPerTrace(diverseRanked, { perTrace }) : diverseRanked;
+  if (policy === "v4") {
+    const before = traceStats(diverseRanked);
+    const after = traceStats(finalRanked);
+    console.error(
+      `[DEBUG] traceSelect records ${before.records}→${after.records} ` +
+      `traces ${before.traces}→${after.traces} unresolved=${before.unresolved} perTrace=${perTrace}`,
+    );
+  }
 
   const results: Array<{ id: string; content: string; score: number; created_at: string }> = [];
 
@@ -533,8 +563,8 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   }
 
   // ---- POLICY (auth-protected diagnostic switch) ----
-  // POST /policy {"policy":"v1"|"v2"|"v3"} — flips the retrieval policy at runtime
-  // so A/B arms can be measured on identical data without a redeploy.
+  // POST /policy {"policy":"v1"|"v2"|"v3"|"v4"} — flips the retrieval policy at
+  // runtime so A/B arms can be measured on identical data without a redeploy.
   if (path === "/policy") {
     if (req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -544,14 +574,14 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     if (req.method === "POST") {
       try {
         const p = JSON.parse(body) as { policy?: string };
-        if (p.policy === "v1" || p.policy === "v2" || p.policy === "v3") {
-          ACTIVE_POLICY = p.policy;
+        if (p.policy !== undefined && (KNOWN_POLICIES as readonly string[]).includes(p.policy)) {
+          ACTIVE_POLICY = p.policy as Policy;
           console.log(`[POLICY] switched to ${ACTIVE_POLICY}`);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ policy: ACTIVE_POLICY }));
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "policy must be 'v1', 'v2' or 'v3'" }));
+          res.end(JSON.stringify({ error: `policy must be one of ${KNOWN_POLICIES.join(", ")}` }));
         }
       } catch (e) {
         res.writeHead(400, { "Content-Type": "application/json" });
