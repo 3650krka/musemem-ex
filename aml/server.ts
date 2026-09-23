@@ -60,9 +60,46 @@ const TOP_K = Number(process.env.AML_TOP_K ?? 100);
  * retrieval purity is not a valid proxy for the board's scored items — returnSize
  * is a cost tier, taskSolve is the score. See src/service/trace-select.ts for the
  * full breakdown and the untested question-class-conditional variant it suggests.
+ *
+ * v5 / v6 = the same mechanism at cap 2 and cap 3, forming a dose series with v4.
+ * The uncapped arms naturally deliver 2.79 chunks per trace, so cap 1 (v4) is the
+ * extreme end and cap 2 is the untested midpoint. These arms exist to map the
+ * dose-response curve: if accuracy recovers monotonically with the cap while
+ * coverage still improves over v2, there is a setting that buys the returnSize
+ * tier without paying in taskSolve. If accuracy stays flat across caps, then
+ * within-session redundancy is payload at every degree and the whole direction
+ * is closed. A question-class-conditional variant was considered and rejected —
+ * see TRACE_PER_BY_POLICY. NOTE the classifier check that killed it: the
+ * regressing question type is classified assistant-content by the benchmark, but
+ * classifyQuestion() returns assistant-content for 0 of those 5 questions (they
+ * read as first-person and match PERSONAL_FACT_RE first), so a conditional keyed
+ * on that class would have been dead code and its null result uninformative.
  */
-const KNOWN_POLICIES = ["v1", "v2", "v3", "v4"] as const;
+const KNOWN_POLICIES = ["v1", "v2", "v3", "v4", "v5", "v6"] as const;
 type Policy = (typeof KNOWN_POLICIES)[number];
+
+/**
+ * Chunks retained per originating session (trace). Infinity = uncapped, which is
+ * what every pre-v4 arm does; the cap is applied after ranking and before the
+ * character budget loop.
+ *
+ * v4/v5/v6 form a DOSE SERIES over one parameter rather than three unrelated
+ * mechanisms. v4 (cap 1) is measured: a real net −5 regression against a ±3 noise
+ * band, concentrated entirely in one question type. The dose in between was never
+ * tested — the uncapped arms naturally deliver 2.79 chunks per trace, so cap 3
+ * binds only on heavy tails and cap 2 is the meaningful midpoint. Sweeping the
+ * knob maps a dose-response curve instead of betting on a single point, and it
+ * keeps the experiment at ONE free parameter measured on the aggregate (n=30),
+ * which is the granularity this sample can actually resolve. A per-question-type
+ * conditional was considered and REJECTED: the 6 per-type cells hold 4-5 questions
+ * each, where a single flip moves a cell 20-25pp, and 5 of the 6 cells were
+ * within noise. Only the aggregate effect was measurable.
+ */
+const TRACE_PER_BY_POLICY: Record<Policy, number> = {
+  v1: Infinity, v2: Infinity, v3: Infinity,
+  v4: 1, v5: 2, v6: 3,
+};
+
 function policyFromEnv(v: string | undefined): Policy {
   return (KNOWN_POLICIES as readonly string[]).includes(v ?? "") ? (v as Policy) : "v2";
 }
@@ -277,18 +314,20 @@ async function searchPipeline(
   const DIVERSITY = Number(process.env.AML_SESSION_DIVERSITY ?? 0);
   const diverseRanked = DIVERSITY > 0 ? sessionDiversityRerank(ranked, DIVERSITY) : ranked;
 
-  // v4: trace-level selection. Applied AFTER ranking and BEFORE the budget loop,
-  // so the character budget is spent on distinct episodes rather than on several
-  // chunks of the same one. Fail-open: records whose session cannot be resolved
-  // are kept. perTrace is overridable so the redundancy/coverage trade can be
-  // swept instead of assumed to be optimal at 1.
-  const perTrace = Number(process.env.AML_TRACE_PER ?? 1);
-  const finalRanked = policy === "v4" ? selectPerTrace(diverseRanked, { perTrace }) : diverseRanked;
-  if (policy === "v4") {
+  // Trace-level selection (arms v4/v5/v6 — see TRACE_PER_BY_POLICY). Applied
+  // AFTER ranking and BEFORE the budget loop, so the character budget is spent on
+  // distinct episodes rather than on several chunks of the same one. Fail-open:
+  // records whose session cannot be resolved are kept. AML_TRACE_PER overrides the
+  // arm's cap so a sweep needs no redeploy; Infinity disables selection entirely.
+  const envPerTrace = Number(process.env.AML_TRACE_PER ?? 0);
+  const perTrace = envPerTrace > 0 ? envPerTrace : TRACE_PER_BY_POLICY[policy];
+  const selecting = Number.isFinite(perTrace);
+  const finalRanked = selecting ? selectPerTrace(diverseRanked, { perTrace }) : diverseRanked;
+  if (selecting) {
     const before = traceStats(diverseRanked);
     const after = traceStats(finalRanked);
     console.error(
-      `[DEBUG] traceSelect records ${before.records}→${after.records} ` +
+      `[DEBUG] traceSelect policy=${policy} records ${before.records}→${after.records} ` +
       `traces ${before.traces}→${after.traces} unresolved=${before.unresolved} perTrace=${perTrace}`,
     );
   }
