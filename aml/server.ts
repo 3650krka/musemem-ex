@@ -47,14 +47,19 @@ const TOP_K = Number(process.env.AML_TOP_K ?? 100);
  * docs/invalid-mechanisms.md. A previous v3 arm (semantic recency chains) was
  * rejected outright — its trigger criterion was falsified.
  *
- * v4 = v2 plus trace-level selection (one best chunk per originating session)
- * and is likewise OPT-IN ONLY, pending an end-to-end measurement. It trades
- * within-trace redundancy for distinct-trace coverage, which improves the
- * retrieval metrics and shrinks returnSize — but returnSize is a COST TIER on
- * the board while taskSolve is the SCORE, and retrieval-params.ts already
- * records that removing redundancy cost −10..11pp end-to-end. So v4 must be
- * validated on taskSolve before it can default on. See
- * src/service/trace-select.ts for the full argument and the measured ratios.
+ * v4 = v2 plus trace-level selection (one best chunk per originating session).
+ * OPT-IN ONLY AND MEASURED TO BE A REGRESSION — do not make it the default.
+ * It trades within-trace redundancy for distinct-trace coverage, and both halves
+ * of that trade were confirmed on a 30-question stratified end-to-end A/B with a
+ * repeated control arm: avgTraces 17.4→33.9 and avgChars 24,935→21,355, but
+ * accuracy 21/30 (70%) → 15/29 (52%), a net −5 questions against a ±3 noise
+ * band. The collapse is concentrated in depth-seeking questions
+ * (single-session-assistant 5/5 → 1/5) where the extra chunks from the correct
+ * session carry the answer. This is the same finding retrieval-params.ts records
+ * for byte dedup (−10..11pp): redundant evidence reinforces the answer model, so
+ * retrieval purity is not a valid proxy for the board's scored items — returnSize
+ * is a cost tier, taskSolve is the score. See src/service/trace-select.ts for the
+ * full breakdown and the untested question-class-conditional variant it suggests.
  */
 const KNOWN_POLICIES = ["v1", "v2", "v3", "v4"] as const;
 type Policy = (typeof KNOWN_POLICIES)[number];

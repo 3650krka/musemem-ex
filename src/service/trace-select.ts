@@ -18,33 +18,68 @@
  * ratio (~1.8x measured), while shrinking the payload — the two move together
  * rather than trading off.
  *
- * WHY THIS IS OPT-IN AND NOT THE DEFAULT. The gain above is stated in RETRIEVAL
- * terms (distinct-trace coverage, Hit@5, Recall@5). Those are purity proxies, and
- * this codebase has already been burned by optimising one. src/core/
- * retrieval-params.ts records an end-to-end ablation over the same 90 questions:
+ * WHY THIS IS OPT-IN AND NOT THE DEFAULT — AND NOW MEASURED TO BE A REGRESSION.
+ * The gain described above is stated in RETRIEVAL terms (distinct-trace coverage,
+ * Hit@5, Recall@5). Those are purity proxies, and this codebase had already been
+ * burned by optimising one: src/core/retrieval-params.ts records an end-to-end
+ * ablation over the same 90 questions where removing redundancy cost −10..11pp at
+ * both blend weights ("evidence redundancy REINFORCES the answering model;
+ * purity is not a valid optimization proxy"). Trace selection removes strictly
+ * more redundancy than byte dedup, so that prior predicted a cost. It was right.
  *
- *     w0.6 no-dedup 52.2% | w0.6 dedup 42.2%
- *     w0.45 no-dedup 51.1% | w0.45 dedup 40.0%
- *     "Deduplication costs −10..11pp at BOTH weights — evidence redundancy
- *      REINFORCES the answering model; purity is not a valid optimization proxy."
+ * END-TO-END RESULT (aml/ab-trace.ts): net −5 questions against a ±3 noise band,
+ * so a real regression, not variance. 30 questions stratified 5 per question_type
+ * across all 6 types; haystacks ingested ONCE so every arm shares byte-identical
+ * stores; same answer model at temperature 0; arms run v2 → v4 → v2b so the
+ * repeated control brackets the treatment and model variance is measured rather
+ * than assumed.
+ *     v2   21/30 (70%)   avgTraces 17.4   avgRecs 48.4   avgChars 24,935
+ *     v4   15/29 (52%)   avgTraces 33.9   avgRecs 33.9   avgChars 21,355
+ *     v2b  23/29 (79%)   avgTraces 17.5   avgRecs 49.1   avgChars 25,249
+ *     v2-vs-v2b disagree on 3/28 paired questions ⇒ noise band ±3
+ *     paired v2-vs-v4: 3 improved, 8 regressed, 18 unchanged ⇒ net −5
  *
- * Removing within-trace redundancy is strictly MORE purity than byte dedup, so the
- * prior measurement predicts this could cost answer accuracy even while every
- * retrieval metric improves. The leaderboard's scored items are taskSolve /
- * newFeature / bugFix (end-to-end resolution); returnSize and inputTokens are
- * COST TIERS, not score. So the honest expectation is: this buys tier position
- * and may cost score.
+ * The mechanism demonstrably fired, so this is not a null result from dead code:
+ * the precondition probe measured 2.94 chunks per trace on this corpus (higher
+ * than the 1.84 on the retrieval harness), and avgTraces rose 17.4 → 33.9 while
+ * avgChars FELL 24,935 → 21,355. Both the coverage gain and the size saving were
+ * real. The answer model got strictly more distinct episodes in strictly fewer
+ * characters and answered 18pp worse.
  *
- * Consequently it ships as policy arm v4, off by default, and must be validated
- * on taskSolve end-to-end (the coding harness emits all nine board metrics, and
- * its noise floor is ±1 task = ±2.0pp taskSolve, well below the 10pp effect the
- * prior ablation implies) before it can become the default.
+ * WHY, per question type — the effect is not uniform:
+ *     single-session-assistant    5/5 → 1/5   (collapse is catastrophic)
+ *     single-session-user         5/5 → 4/5
+ *     multi-session               3/5 → 2/5
+ *     temporal-reasoning          4/5 → 3/4
+ *     knowledge-update            3/5 → 3/5   (one flip each way)
+ *     single-session-preference   1/5 → 2/5   (improves)
+ * The split is depth versus breadth. When the answer lives inside the CONTENT of
+ * one episode ("what did the assistant tell me about X"), the extra chunks from
+ * that same session carry the answer and capping at one deletes them. When the
+ * answer requires ranging ACROSS episodes (preferences assembled over time,
+ * superseded values), more distinct traces helps. Redundant chunks of the correct
+ * session are not waste — they are the payload.
+ *
+ * A question-class-conditional variant (trace collapse only for breadth-seeking
+ * classes) is the hypothesis this data suggests, but it is UNTESTED and must earn
+ * its own A/B before anyone wires it. Do not assume the per-type table above
+ * transfers: it rests on 4-5 questions per cell, so a single flip moves a cell by
+ * 20-25pp.
+ *
+ * KEPT RATHER THAN DELETED for the same reason as disclosure.ts: the mechanism
+ * works exactly as specified and is fully unit-tested; what fails is the
+ * assumption that retrieval purity is what the board scores. On the board
+ * taskSolve/newFeature/bugFix are the scored items while returnSize and
+ * inputTokens are COST TIERS, so a −14% returnSize cannot pay for −18pp accuracy.
  *
  * FAIL-OPEN BY DESIGN. A record whose trace cannot be resolved is never dropped:
  * it is treated as its own trace. Losing evidence to a missing metadata field
  * would be a worse failure than the redundancy this removes — the same mistake
  * class as the earlier [Latest] marker, which silently depended on a metadata key
- * the injection path never wrote and was dead code for its whole life.
+ * the injection path never wrote and was dead code for its whole life. That is
+ * also why the A/B harness measures chunks-per-trace BEFORE scoring any arm: on a
+ * corpus where sessions already contribute one chunk each, v4 would be a no-op
+ * and its null result would be uninformative rather than evidence of no effect.
  */
 
 export interface TraceSelectOptions {
