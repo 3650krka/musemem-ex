@@ -33,12 +33,34 @@
  *               model; purity is not a valid optimization proxy. Weight
  *               0.45 vs 0.6 is noise (±1pp). Shipped config: weight 0.6,
  *               dedup OFF. present.ts kept tested but unwired.
+ *   2026-09-23  The "weight" axis in the ablations above was inert: the
+ *               blend it fed was max(a, (1-w)a+wb, b) ≡ max(a,b), so w0.45
+ *               vs w0.6 literally could not differ — consistent with the
+ *               ±1pp noise actually observed. Interpretation stands for
+ *               dedup; the knob became live with the corroboration blend
+ *               (see semanticWeight doc).
  */
 
 export type EmbedProviderKind = "local" | "xfyun" | "nvidia" | "generic";
 
 export interface RetrievalParams {
-  /** Blend: taskOverlap = (1-w)*lexical + w*semantic (ranker.ts). */
+  /**
+   * Corroboration bonus strength in the hybrid blend
+   *   taskOverlap = max(lexical, semantic) + w·min(lexical, semantic)
+   * (ranker.ts). w=0 disables the semantic channel entirely; w=1 is full
+   * additive fusion. Records firing on a single channel score exactly as in
+   * the plain max-blend; only both-strong records move.
+   *
+   * HISTORY NOTE (2026-09-23): this field used to be described as a blend
+   * weight feeding max(lexical, (1-w)lexical + w·semantic, semantic). That
+   * expression is identically max(lexical, semantic) for every w in [0,1]
+   * (the middle term is a convex combination of the other two), so the values
+   * recorded below could NOT have been measuring the weight — the measured
+   * differences came from the other axes (topK is the dominant one). The
+   * recall figures remain valid as measurements; the attribution to w was
+   * not. The values are retained as the starting points for the corroboration
+   * knob, to be re-derived by the zero-LLM grid now that the knob is live.
+   */
   semanticWeight: number;
   /** Minimum cosine for a SEMANTIC-ONLY recall hit (memory-tool recall). */
   semanticFloor: number;

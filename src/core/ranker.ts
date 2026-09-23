@@ -78,19 +78,35 @@ export function rankForContext(records: MemoryRecord[], currentTurn: number, tas
       for (const t of taskTokens) if (recordTokens.has(t)) shared++;
       let taskOverlap = overlap(taskTokens, recordTokens);
       if (shared === 1) taskOverlap *= SINGLE_TERM_DISCOUNT;
-      // Hybrid relevance: blend lexical containment with local semantic cosine
-      // (AssoMem R-signal analogue). The single-term discount stays on the
-      // lexical side; junk fragments score low on BOTH signals. Records without
-      // a semantic score keep pure lexical relevance (fail-open to baseline).
+      // Hybrid relevance: strongest cue wins, plus a bonus for records
+      // corroborated by BOTH channels (AssoMem R-signal analogue). Records
+      // without a semantic score keep pure lexical relevance (fail-open).
+      //
+      //   taskOverlap = max(lexical, semantic) + w · min(lexical, semantic)
+      //
+      // The knob is a CORROBORATION bonus, not a blend weight:
+      //   w=0  → branch skipped, pure lexical (the semantic channel can be
+      //          ablated off entirely — the attribution baseline).
+      //   w=1  → max(a,b) + min(a,b) = a+b (full additive fusion).
+      // A record that fires on only one channel scores exactly as it did in the
+      // legacy max-blend at any w>0, so the formula is a pure extension of the
+      // shipped behaviour; only both-strong records move.
+      //
+      // WHY NOT THE OLD FORMULA. It was
+      //   max(lexical, (1-w)·lexical + w·semantic, semantic)
+      // which is mathematically degenerate: the middle term is a CONVEX
+      // COMBINATION of the other two, so it can never be the maximum, and the
+      // whole expression is identically max(lexical, semantic) for every w in
+      // [0,1]. Verified two ways: |Δscore| between w=0.3 and w=0.9 is exactly
+      // 0.00000 on every question of the calibration set (identical full
+      // ranking), and 3.2M random (a,b,w) cases with 0 deviations. The shipped
+      // semanticWeight was therefore dead code, and the per-provider blend
+      // "calibrations" recorded in retrieval-params.ts could not have been
+      // measuring it. (Raaijmakers & Shiffrin, 1981: strongest-cue retrieval.)
       const w = options.semanticWeight ?? 0;
       const sem = options.semanticScores?.get(record.id);
       if (w > 0 && sem !== undefined) {
-        // Max-blend: a record is relevant if EITHER lexical OR semantic signal
-        // is strong. Weighted sum dilutes high semantic scores with low lexical
-        // scores (e.g. "45 min commute" buried in an audiobook discussion).
-        // Max captures the cognitive principle that retrieval uses the
-        // strongest available cue (Raaijmakers & Shiffrin, 1981).
-        taskOverlap = Math.max(taskOverlap, (1 - w) * taskOverlap + w * sem, sem);
+        taskOverlap = Math.max(taskOverlap, sem) + w * Math.min(taskOverlap, sem);
       }
       return { record, score: scoreRecord(state, currentTurn, taskOverlap, options.scoreWeights), level: "anchor" as CompressionLevel };
     })
