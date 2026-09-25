@@ -84,7 +84,16 @@ function charChunks(text: string): string[] {
   return out.slice(0, 6);
 }
 
-async function callEmbeddings(preset: RemoteEmbedPreset, key: string, texts: string[], inputType: "query" | "passage", name: RemoteEmbedName): Promise<Float32Array[]> {
+/** Bounded retry for transient embedding failures. The AML smoke/eval
+ * hammers the endpoint with rapid Add/Search requests; a single flaky
+ * upstream call (connect timeout, 429, 5xx) must not fail the whole turn.
+ * Retry only transient classes — 4xx client errors are deterministic and
+ * retrying them just burns quota. */
+const EMBED_MAX_ATTEMPTS = 4;
+const EMBED_ATTEMPT_TIMEOUT_MS = 60_000;
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+async function callEmbeddings(preset: RemoteEmbedPreset, key: string, texts: string[], inputType: "query" | "passage", name: RemoteEmbedName, attempt = 0): Promise<Float32Array[]> {
   const body: Record<string, unknown> = { model: preset.model, input: texts, encoding_format: "float" };
   if (preset.supportsInputType) body.input_type = inputType;
   if (preset.dimensions !== undefined) body.dimensions = preset.dimensions;
@@ -93,10 +102,28 @@ async function callEmbeddings(preset: RemoteEmbedPreset, key: string, texts: str
     method: "POST",
     headers: { accept: "application/json", "content-type": "application/json", Authorization: `Bearer ${key}` },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(EMBED_ATTEMPT_TIMEOUT_MS),
   };
   if (agent) opts.dispatcher = agent;
-  const res = await proxyFetch(preset.url, opts);
-  if (!res.ok) throw new Error(`embed HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  let res: any;
+  try {
+    res = await proxyFetch(preset.url, opts);
+  } catch (e) {
+    // Network/timeout failure — transient, retry with exponential backoff.
+    if (attempt + 1 < EMBED_MAX_ATTEMPTS) {
+      await new Promise((r) => setTimeout(r, 500 * (1 << attempt)));
+      return callEmbeddings(preset, key, texts, inputType, name, attempt + 1);
+    }
+    throw e;
+  }
+  if (!res.ok) {
+    const detail = (await res.text()).slice(0, 200);
+    if (RETRYABLE_STATUS.has(res.status) && attempt + 1 < EMBED_MAX_ATTEMPTS) {
+      await new Promise((r) => setTimeout(r, 500 * (1 << attempt)));
+      return callEmbeddings(preset, key, texts, inputType, name, attempt + 1);
+    }
+    throw new Error(`embed HTTP ${res.status}: ${detail}`);
+  }
   const j = (await res.json()) as { data: Array<{ embedding: number[] }> };
   return j.data.map((d) => Float32Array.from(d.embedding));
 }

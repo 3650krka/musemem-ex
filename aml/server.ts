@@ -629,21 +629,24 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       // from disk with the correct state.
       scopes.delete(payload.user_id);
 
-      // Background incremental encoding (fire-and-forget, one-at-a-time).
-      // Each Add encodes up to 50 new records; AML sends ~48 Adds per question,
-      // so by Search time most records are already in the sidecar cache.
-      // Add returns 200 immediately — AML contract is synchronous storage.
-      if (!scope.encoding) {
-        const gw = await getEmbed();
-        if (gw) {
-          scope.encoding = true;
-          void (async () => {
-            try {
-              const evidence = scope.store.readEvidence(payload.user_id);
-              await encodeWithCache(scope.store, payload.user_id, evidence, gw, { maxEncode: 50 });
-            } catch { /* best-effort */ }
-            finally { scope.encoding = false; }
-          })();
+      // Synchronous encoding: the AML contract requires Add to return only
+      // after the submitted messages are fully searchable ("如果系统在后台执行
+      // 写入，请等待其完成后再返回成功，否则基准可能会在记忆就绪前发起检索").
+      // Awaiting the incremental encode means a subsequent Search hits a warm
+      // sidecar cache instead of paying on-demand encoding latency — which
+      // under the smoke's rapid Add→Search pacing can exceed the deadline and
+      // surface as a (falsely) empty Search. AML allows 30 min per request, so
+      // the extra encode latency here is acceptable.
+      const gw = await getEmbed();
+      if (gw) {
+        try {
+          const evidence = scope.store.readEvidence(payload.user_id);
+          await encodeWithCache(scope.store, payload.user_id, evidence, gw, { maxEncode: 200 });
+        } catch (e) {
+          // Storage is already durable (appendEvidence succeeded). A failed
+          // pre-encode degrades to on-demand encoding at Search time rather
+          // than failing the Add, so log and continue to the 200.
+          console.error(`[add] sync encode failed for ${payload.user_id}: ${(e as Error).message}`);
         }
       }
 
