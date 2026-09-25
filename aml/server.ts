@@ -303,6 +303,21 @@ function parseYMD(dateStr: string | undefined): DateYMD | null {
   return m ? { y: Number(m[1]), m: Number(m[2]), d: Number(m[3]) } : null;
 }
 
+/**
+ * AML-server recall floor (budget-driven recall). The shared
+ * DEFAULT_CONFIG.activationThreshold (0.28) is the live system's precision gate;
+ * using it here hard-filters records BEFORE the char budget is spent. The smoke
+ * evidence: several searches leave the budget under-filled (beam-2 emitted
+ * 14162/30000 chars, personamem 5362/30000) while AML reports missing Search
+ * records — the gold record scored below 0.28 and was dropped while budget room
+ * went unused. Since the char budget is already the binding precision guardrail
+ * (it caps the payload AML scores), the hard threshold only WASTES recall. Lower
+ * the recall floor so the budget loop can fill the budget with the next-best
+ * records. Scoped to the AML server: DEFAULT_CONFIG and the live injection path
+ * (src/) are untouched. AML_RECALL_FLOOR overrides for A/B; 0 disables the floor.
+ */
+const AML_RECALL_FLOOR = Number(process.env.AML_RECALL_FLOOR ?? 0.08);
+
 async function searchPipeline(
   userId: string,
   query: string,
@@ -389,8 +404,10 @@ async function searchPipeline(
     // as tiebreaker. This ensures the same query always returns the same
     // results, eliminating retrieval variance as a source of instability.
     .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id))
-    .filter((r) => r.score >= DEFAULT_CONFIG.activationThreshold);
-    console.error(`[DEBUG] afterThreshold=${ranked.length} topRanked=${ranked[0]?.score.toFixed(4)}`);
+    // Budget-driven recall: lower AML recall floor, not the live 0.28 gate — the
+    // char budget downstream is the real precision cap (see AML_RECALL_FLOOR).
+    .filter((r) => r.score >= AML_RECALL_FLOOR);
+    console.error(`[DEBUG] afterThreshold=${ranked.length} topRanked=${ranked[0]?.score.toFixed(4)} floor=${AML_RECALL_FLOOR}`);
   } catch (e) {
     console.error(`[DEBUG] Phase3 CRASH: ${(e as Error).message?.slice(0, 200)}`);
     ranked = [];
