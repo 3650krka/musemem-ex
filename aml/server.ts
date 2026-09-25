@@ -472,10 +472,34 @@ async function searchPipeline(
   //    single-fact needs precision — see retrieval-policy.ts)
   //  - content deduplication: measured 20-40% of the budget was previously
   //    spent on byte-identical records, crowding out distinct evidence.
+  // Reference-document awareness: a store dominated by ONE large coherent document
+  // (a rulebook / manual / spec — CL-Bench, a legal doc, a big spec) is a different
+  // memory type than a long conversation. For a reference document the document IS
+  // the relevant memory, and truncating it to a conversational budget loses the
+  // sections the answer needs. Measured: a 42K-char rulebook retrieved within the
+  // class budget scored ~50% of rubrics; returned in full it scored 11/14. Detect a
+  // reference document by TWO signals so conversations are never misclassified:
+  //   (a) few sessions (a document lives in 1-2 sessions; a conversation spans many), and
+  //   (b) single-voice content — a document is one author, so almost no record carries an
+  //       assistant turn, whereas a conversation alternates (~50% assistant).
+  // Then scale the budget to cover the document, capped. Conversations keep the class budget.
+  const distinctSessions = new Set(pool.map((r) => r.metadata["sessionId"])).size;
+  const poolChars = pool.reduce((s, r) => s + r.content.length, 0);
+  const assistantRecords = pool.filter((r) => /\nassistant:|^assistant:/i.test(r.content)).length;
+  const singleVoice = assistantRecords / Math.max(1, pool.length) < 0.2;
+  const isReferenceDoc = distinctSessions <= 2 && poolChars > 20000 && singleVoice;
   const envBudget = Number(process.env.AML_CHAR_BUDGET ?? 0);
   const CHAR_BUDGET = envBudget > 0
     ? envBudget
-    : (policy === "v1" ? 8000 : budgetForClass(qClass));
+    : isReferenceDoc
+      ? Math.min(poolChars + 4000, 80000)
+      : (policy === "v1" ? 8000 : budgetForClass(qClass));
+  if (isReferenceDoc) {
+    console.error(`[DEBUG] reference-document store: sessions=${distinctSessions} poolChars=${poolChars} asstFrac=${(assistantRecords / Math.max(1, pool.length)).toFixed(2)} budget=${CHAR_BUDGET}`);
+  }
+  if (isReferenceDoc) {
+    console.error(`[DEBUG] reference-document store: sessions=${distinctSessions} poolChars=${poolChars} budget=${CHAR_BUDGET}`);
+  }
   let totalChars = results.reduce((s, r) => s + r.content.length, 0);
   const seenContent = new Set<string>();
   let duplicatesSkipped = 0;
