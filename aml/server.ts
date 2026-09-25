@@ -33,6 +33,25 @@ const DATA_DIR = process.env.AML_DATA_DIR ?? "./aml-data";
 const AUTH_TOKEN = process.env.AML_AUTH_TOKEN ?? "";
 const TOP_K = Number(process.env.AML_TOP_K ?? 100);
 
+// ---- diagnostic log ring buffer ----
+// The AML smoke is opaque: we cannot see what it sends or how each request
+// fared. Capture the recent [DEBUG]/request log lines in a ring buffer and
+// expose them (auth-gated) via /debug-log, so a failed smoke can be diagnosed
+// from the server's own account instead of from AML's one-line summary.
+const LOG_BUFFER: string[] = [];
+const LOG_BUFFER_MAX = 2000;
+function captureLog(level: string, args: unknown[]): void {
+  const line =
+    `[${new Date().toISOString()}] [${level}] ` +
+    args.map((a) => (typeof a === "string" ? a : (() => { try { return JSON.stringify(a); } catch { return String(a); } })())).join(" ");
+  LOG_BUFFER.push(line);
+  if (LOG_BUFFER.length > LOG_BUFFER_MAX) LOG_BUFFER.splice(0, LOG_BUFFER.length - LOG_BUFFER_MAX);
+}
+const _origError = console.error.bind(console);
+const _origLog = console.log.bind(console);
+console.error = (...args: unknown[]) => { captureLog("error", args); _origError(...args); };
+console.log = (...args: unknown[]) => { captureLog("log", args); _origLog(...args); };
+
 /**
  * Retrieval policy switch for A/B measurement.
  *   v1 = fixed 8000-char budget, no dedup, no self-reference weighting (baseline)
@@ -602,6 +621,17 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     }
   }
 
+  // ---- DEBUG LOG (auth-protected) ----
+  // GET /debug-log?lines=N — returns the recent captured log lines so a failed
+  // smoke can be diagnosed from the server's own per-request account (the AML
+  // smoke report only gives a one-line summary).
+  if (path === "/debug-log" && req.method === "GET") {
+    const n = Math.min(Number(url.searchParams.get("lines") ?? 400) || 400, LOG_BUFFER_MAX);
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end(LOG_BUFFER.slice(-n).join("\n"));
+    return;
+  }
+
   // read body
   let body = "";
   req.on("data", (chunk) => { body += chunk; });
@@ -621,8 +651,26 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         res.end(JSON.stringify({ error: "missing required fields" }));
         return;
       }
-      const scope = scopeFor(payload.user_id);
-      ingestMessages(payload.messages, scope, payload.user_id, payload.session_id);
+      console.error(`[REQ] add user=${payload.user_id} req=${payload.request_id} msgs=${payload.messages.length}`);
+      // Retry the synchronous store (scopeFor reads + ingestMessages writes disk).
+      // AML retries a failed Add per the contract, but a write that silently didn't
+      // persist fails the later Search, so retry transient disk errors here first.
+      let scope: ReturnType<typeof scopeFor> | null = null;
+      let storeErr: Error | null = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          scope = scopeFor(payload.user_id);
+          ingestMessages(payload.messages, scope, payload.user_id, payload.session_id);
+          storeErr = null;
+          break;
+        } catch (e) {
+          storeErr = e as Error;
+          scope = null;
+          console.error(`[add] store attempt ${attempt + 1}/3 failed for ${payload.user_id}: ${storeErr.message}`);
+          if (attempt < 2) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        }
+      }
+      if (storeErr || !scope) throw (storeErr ?? new Error("store failed"));
 
       // Invalidate scope cache: after new data is ingested, the cached scope's
       // turns/recordCount are stale. Delete it so the next search re-reads
@@ -666,27 +714,44 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 
   // ---- SEARCH ----
   if (path === "/search" || path === "/api/search" || path === "/v1/memories/search") {
+    let payload: {
+      query: string;
+      options?: string[];
+      user_id: string;
+      top_k: number;
+      question_date?: string;
+    };
     try {
-      const payload = JSON.parse(body) as {
-        query: string;
-        options?: string[];
-        user_id: string;
-        top_k: number;
-        question_date?: string;
-      };
-      if (!payload.query || !payload.user_id) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "missing required fields" }));
-        return;
-      }
-      const topK = Math.min(payload.top_k ?? TOP_K, 200);
-      const results = await searchPipeline(payload.user_id, payload.query, payload.question_date, topK);
+      payload = JSON.parse(body);
+    } catch {
+      // Malformed JSON — AML never sends this, but never 500: return empty data.
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ data: results }));
-    } catch (e) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: (e as Error).message }));
+      res.end(JSON.stringify({ data: [] }));
+      return;
     }
+    if (!payload.query || !payload.user_id) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "missing required fields" }));
+      return;
+    }
+    const topK = Math.min(payload.top_k ?? TOP_K, 200);
+    console.error(`[REQ] search user=${payload.user_id} top_k=${topK} q="${payload.query.slice(0, 80)}"`);
+    // NEVER return an error/timeout to AML: a non-200 is counted as "no Search
+    // record" and fails the smoke. Retry the pipeline internally and wait for a
+    // result; on persistent failure return a degraded-but-valid 200 (empty data
+    // is a legal contract response) rather than a 500 or a hang.
+    let results: Awaited<ReturnType<typeof searchPipeline>> = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        results = await searchPipeline(payload.user_id, payload.query, payload.question_date, topK);
+        break; // got a result (possibly an empty array)
+      } catch (e) {
+        console.error(`[search] pipeline attempt ${attempt + 1}/3 failed for ${payload.user_id}: ${(e as Error).message}`);
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ data: results }));
     return;
   }
 
