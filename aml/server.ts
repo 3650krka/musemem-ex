@@ -318,6 +318,56 @@ function parseYMD(dateStr: string | undefined): DateYMD | null {
  */
 const AML_RECALL_FLOOR = Number(process.env.AML_RECALL_FLOOR ?? 0.08);
 
+// ---- cross-encoder rerank (xfyun xop3qwen8breranker) ----
+// The AML smoke's recall gap traces to a paraphrase / form mismatch: the query is
+// a question, the stored memory is a conversational chunk, so the gold record
+// scores below the top cut. The encoding-specificity principle (Tulving) predicts
+// exactly this — retrieval cues must match the encoding form. A cross-encoder
+// reranker scores (query, document) JOINTLY, so it recovers matches the
+// independent-embedding blend misses. We already ship rerankWithXfyun
+// (bench-measured to rescue paraphrase-gap recall in src/service/memory-tool.ts);
+// this wires it into the AML search. The reranker is a RETRIEVAL model (like the
+// embedder), not the answer LLM, and the search stays fully deterministic.
+function getXfyunKey(): string {
+  let key = process.env.PI_MEMORY_XFYUN_KEY ?? "";
+  if (!key) {
+    try {
+      const cfg = JSON.parse(readFileSync(join(DATA_DIR, "..", "embed-provider.json"), "utf8"));
+      key = cfg.keys?.xfyun ?? "";
+    } catch { /* no key file */ }
+  }
+  return key;
+}
+
+const AML_RERANK = (process.env.AML_RERANK ?? "1") !== "0";
+const AML_RERANK_TOP_N = Number(process.env.AML_RERANK_TOP_N ?? 40);
+
+// REORDER-only (never drops a record) and fail-closed (on any error return the
+// input order unchanged) — so it can only change ORDER, never shrink the pool.
+// The char budget downstream still caps the payload.
+async function rerankCandidates<T extends { record: { id: string; content: string } }>(
+  ranked: T[],
+  query: string,
+): Promise<T[]> {
+  if (!AML_RERANK || ranked.length < 2) return ranked;
+  const key = getXfyunKey();
+  if (!key) return ranked;
+  try {
+    const { rerankWithXfyun } = await import("../src/adapters/embed-http.ts");
+    const topN = ranked.slice(0, AML_RERANK_TOP_N);
+    const docs = topN.map((r) => r.record.content.slice(0, 1500));
+    const scored = await rerankWithXfyun(key, query, docs); // [{index, score}] sorted desc
+    const reordered = scored.map((s) => topN[s.index]).filter(Boolean);
+    const seen = new Set(reordered.map((r) => r.record.id));
+    const out = reordered.concat(ranked.filter((r) => !seen.has(r.record.id)));
+    console.error(`[DEBUG] rerank applied: top${topN.length} reordered, first id ${out[0]?.record.id}`);
+    return out;
+  } catch (e) {
+    console.error(`[search] rerank failed, keeping hybrid order: ${(e as Error).message?.slice(0, 100)}`);
+    return ranked;
+  }
+}
+
 async function searchPipeline(
   userId: string,
   query: string,
@@ -425,7 +475,7 @@ async function searchPipeline(
   const envPerTrace = Number(process.env.AML_TRACE_PER ?? 0);
   const perTrace = envPerTrace > 0 ? envPerTrace : TRACE_PER_BY_POLICY[policy];
   const selecting = Number.isFinite(perTrace);
-  const finalRanked = selecting ? selectPerTrace(diverseRanked, { perTrace }) : diverseRanked;
+  let finalRanked = selecting ? selectPerTrace(diverseRanked, { perTrace }) : diverseRanked;
   if (selecting) {
     const before = traceStats(diverseRanked);
     const after = traceStats(finalRanked);
@@ -434,6 +484,10 @@ async function searchPipeline(
       `traces ${before.traces}→${after.traces} unresolved=${before.unresolved} perTrace=${perTrace}`,
     );
   }
+  // Cross-encoder rerank: reorder the top candidates so paraphrase-gap gold
+  // records surface. Reorder-only and fail-closed; the budget loop below is
+  // unchanged and still caps the payload.
+  finalRanked = await rerankCandidates(finalRanked, query);
 
   const results: Array<{ id: string; content: string; score: number; created_at: string }> = [];
 
