@@ -250,6 +250,26 @@ function ingestMessages(
 
   for (const m of messages) {
     const line = `${m.role}: ${m.content}`;
+    // Oversized single message (e.g. a CL-Bench rulebook of 80-110K chars sent as
+    // ONE user turn). The old loop never split it: it became one giant record, and
+    // at search time the char-budget loop DROPPED it (totalChars + len > CHAR_BUDGET
+    // → break), so the content was stored but never retrievable. Split it into
+    // RECORD_CHARS pieces at paragraph/line/space boundaries so it stays searchable.
+    if (line.length > RECORD_CHARS) {
+      if (buf.length) flush();
+      let rest = line;
+      while (rest.length > RECORD_CHARS) {
+        let cut = rest.lastIndexOf("\n\n", RECORD_CHARS);
+        if (cut < RECORD_CHARS * 0.4) cut = rest.lastIndexOf("\n", RECORD_CHARS);
+        if (cut < RECORD_CHARS * 0.4) cut = rest.lastIndexOf(" ", RECORD_CHARS);
+        if (cut < RECORD_CHARS * 0.3) cut = RECORD_CHARS;
+        buf.push(rest.slice(0, cut));
+        flush(); // each piece is its own record (with the date/session header)
+        rest = rest.slice(cut).replace(/^\n+/, "");
+      }
+      if (rest.trim()) { buf.push(rest); len = rest.length; }
+      continue;
+    }
     if (len + line.length > RECORD_CHARS && buf.length) flush();
     buf.push(line);
     len += line.length;
