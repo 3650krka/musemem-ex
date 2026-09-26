@@ -364,7 +364,19 @@ function getXfyunKey(): string {
   return key;
 }
 
-const AML_RERANK = (process.env.AML_RERANK ?? "1") !== "0";
+// DEFAULT OFF. Wired in on the strength of a 1-question locomo evidence-recall
+// gain (14/15 -> 15/15), but the repo already carried the contradicting A/B:
+// bench/aml-mirror, same xfyun embedder, same 40 coding tasks —
+//   no rerank  taskSolve 95.0  newFeature 90  bugFix 100  search  428ms
+//   rerank     taskSolve 87.5  newFeature 75  bugFix 100  search 1666ms
+// i.e. rerank costs 7.5 taskSolve / 15 newFeature and 4x the latency. The
+// mechanism is measured too, not assumed: on personamem the cross-encoder scored
+// a topically-similar boilerplate sentence 0.9525 while the true gold sentence
+// scored 0.0035, so reranking pulls noise into the fixed char budget and
+// displaces evidence. Recall is not accuracy — a gain in evidence recall on one
+// dataset does not transfer. Kept behind the env flag for future A/B; the
+// reorder-only + fail-closed implementation below is unchanged.
+const AML_RERANK = (process.env.AML_RERANK ?? "0") === "1";
 const AML_RERANK_TOP_N = Number(process.env.AML_RERANK_TOP_N ?? 40);
 
 // REORDER-only (never drops a record) and fail-closed (on any error return the
