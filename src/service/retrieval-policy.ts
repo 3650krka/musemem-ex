@@ -34,8 +34,30 @@ import type { MemoryRecord } from "../core/types.ts";
 
 export type QuestionClass = "aggregation" | "temporal" | "personal-fact" | "assistant-content" | "default";
 
-/** Completeness-critical: the answer is a sum/count over a distributed set. */
-const AGGREGATION_RE = /\bhow many\b|\bhow much\b|\bin total\b|\btotal (?:number|count)\b|\ball the\b|\beach of\b|\blist (?:all|the|of)\b|\bhow long\b/i;
+/**
+ * Completeness-critical: the answer is a sum/count/average over a distributed set.
+ *
+ * MEASURED GAP this closes (LongMemEval-S, 500q): the original pattern only
+ * matched "in total" and "total number|count", so the far more common phrasings
+ * fell through to PERSONAL_FACT_RE — which matches any first-person question —
+ * and got the 16K personal-fact budget (~13 records) instead of 40K (~33).
+ * 18 questions were mis-budgeted, 16 of them multi-session, every one a genuine
+ * sum/average over items spread across several sessions:
+ *   "What is the total amount I spent on luxury items in the past few months?"
+ *   "What is the average age of me, my parents, and my grandparents?"
+ *   "What is the total distance of the hikes I did on two consecutive weekends?"
+ *   "Which airline did I fly with the most in March and April?"
+ * For these a MISSING item is an unrecoverable error, so the tight budget is the
+ * binding constraint. diag-multisession-coverage measured why that matters: on
+ * failing multi-session questions gold-session coverage is 40.6% at k=12 versus
+ * 72.4% at k=40 (11 improved, 3 unchanged, 0 worse) — top-12 spans only 5.9 of
+ * ~47 haystack sessions while the gold needs 3.5.
+ * Broadening is safe by construction: it only ever RAISES a budget, the timeline
+ * injection is gated by its own TEMPORAL_PROMPT_RE (not by this class), and
+ * selfReferenceFactor already applies to aggregation. Verified 0 flips out of
+ * assistant-content and all pre-existing classification tests unchanged.
+ */
+const AGGREGATION_RE = /\bhow many\b|\bhow much\b|\bhow long\b|\btotal\b|\ball the\b|\beach of\b|\blist (?:all|the|of)\b|\b(?:average|mean|sum|combined)\b|\bthe most\b/i;
 
 /** Time reasoning: needs event dates and an explicit reference point. */
 const TEMPORAL_RE = /\bwhen\b|\bhow (?:many|long).{0,30}\b(?:ago|before|after|since)\b|\bbetween\b.{0,40}\band\b|\bfirst to last\b|\b(?:first|last|earlier|earliest|latest|recent(?:ly)?)\b|\border\b|\b(?:before|after) (?:the|my|that)\b|\bsince\b|\b\d+\s*(?:days?|weeks?|months?|years?) ago\b/i;

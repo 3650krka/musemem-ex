@@ -82,6 +82,27 @@ test("temporal prompt regex: EN + ZH markers, non-temporal prompts excluded", ()
   assert.ok(!TEMPORAL_PROMPT_RE.test("fix the null pointer crash in parser.ts"), "plain task prompt does not fire");
 });
 
+// Regression guard for the measured LongMemEval-S gap: these five verbatim
+// temporal-reasoning questions did NOT fire the old pattern, so they were
+// answered without a chronological scaffold and came back "0 days ago (or
+// today)" against golds like "7 days ago". Coverage went 128/133 -> 133/133.
+test("temporal prompt regex: recency, bare past, clock time and month names fire", () => {
+  assert.ok(TEMPORAL_PROMPT_RE.test("Which mode of transport did I use most recently, a bus or a train?"), "recency");
+  assert.ok(TEMPORAL_PROMPT_RE.test("Which streaming service did I start using most recently?"), "recency");
+  assert.ok(TEMPORAL_PROMPT_RE.test("Which bike did I fixed or serviced the past weekend?"), "bare past reference");
+  assert.ok(TEMPORAL_PROMPT_RE.test("What time do I wake up on Tuesdays and Thursdays?"), "clock time");
+  assert.ok(TEMPORAL_PROMPT_RE.test("Which airline did I fly with the most in March and April?"), "bare month names");
+});
+
+// The gate costs budget wherever it fires, so the broadening must not leak onto
+// ordinary non-temporal prompts.
+test("temporal prompt regex: broadened markers stay off non-temporal prompts", () => {
+  assert.ok(!TEMPORAL_PROMPT_RE.test("Refactor the auth middleware to use dependency injection"));
+  assert.ok(!TEMPORAL_PROMPT_RE.test("Add a retry wrapper around the fetch client"));
+  assert.ok(!TEMPORAL_PROMPT_RE.test("Why does the parser throw on empty input?"));
+  assert.ok(!TEMPORAL_PROMPT_RE.test("What is my favorite color?"));
+});
+
 // ---- injection wiring ----
 let dir = "";
 let noteDir = "";

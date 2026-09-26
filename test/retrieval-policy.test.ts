@@ -30,6 +30,31 @@ test("aggregation questions are completeness-critical", () => {
   assert.equal(classifyQuestion("How long did the trip take?"), "aggregation");
 });
 
+// Regression guard for the measured mis-budget: these are verbatim LongMemEval-S
+// multi-session questions that used to fall through to PERSONAL_FACT_RE (any
+// first-person question matches it) and got 16K instead of 40K. Each is a sum or
+// average over items distributed across several sessions, so a missing item is an
+// unrecoverable error and completeness must win the budget.
+test("sum/average/superlative phrasings are aggregation, not personal-fact", () => {
+  assert.equal(classifyQuestion("What is the total amount I spent on luxury items in the past few months?"), "aggregation");
+  assert.equal(classifyQuestion("What is the average age of me, my parents, and my grandparents?"), "aggregation");
+  assert.equal(classifyQuestion("What is the total distance of the hikes I did on two consecutive weekends?"), "aggregation");
+  assert.equal(classifyQuestion("Which airline did I fly with the most in March and April?"), "aggregation");
+  assert.equal(classifyQuestion("What is the combined weight of the gear I bought?"), "aggregation");
+});
+
+// The class change must not cost the two mechanisms that ride alongside it: the
+// timeline injection is gated by its own TEMPORAL_PROMPT_RE, and self-reference
+// weighting already covers aggregation. Assert the budget ordering still holds.
+test("aggregation phrasings get the completeness budget", () => {
+  assert.equal(budgetForClass(classifyQuestion("What is the total cost of Lola's vet visit and flea medication?")), budgetForClass("aggregation"));
+  assert.ok(budgetForClass("aggregation") > budgetForClass("personal-fact"));
+  // a promoted question keeps the self-reference boost (user-authored evidence)
+  assert.ok(selfReferenceFactor(classifyQuestion("What is the total amount I spent on gifts?"), {
+    content: "user: I spent $40 on a gift for my brother.",
+  } as never) > 1);
+});
+
 test("temporal questions are detected", () => {
   assert.equal(classifyQuestion("When did I visit MoMA?"), "temporal");
   assert.equal(classifyQuestion("How many weeks ago did I meet my aunt?"), "aggregation"); // 'how many' wins

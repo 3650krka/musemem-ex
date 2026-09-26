@@ -25,9 +25,19 @@ import type { MemoryRecord } from "./types.ts";
 
 /** Temporal-prompt gate (EN + ZH). Fires the timeline section; non-matching
  * prompts pay nothing. Deliberately broad: the section is a small index and
- * bench harm checks showed neutral-to-positive even on non-temporal types. */
+ * bench harm checks showed neutral-to-positive even on non-temporal types.
+ *
+ * MEASURED GAP closed: on LongMemEval-S the old pattern missed 5 of 133
+ * temporal-reasoning questions, so their timeline never fired — the failures
+ * read "got: 0 days ago (or today)" against gold "7 days ago", i.e. the model
+ * had no chronological scaffold to compute the interval from. The missed markers
+ * were recency ("used most recently"), a bare past reference ("the past
+ * weekend"), clock time ("What time do I wake up") and bare month names ("in
+ * March and April"). Adding them lifts temporal coverage 128/133 -> 133/133 for
+ * +13 non-temporal fires out of 367, and the must-not-fire cases (plain task
+ * prompts, "What is my favorite color?") stay silent. */
 export const TEMPORAL_PROMPT_RE =
-  /\bhow (many|long)\b|\bago\b|\bbetween\b|\border\b|\bbefore\b|\bafter\b|\bsince\b|\bfirst\b|\blast\b|\bwhen\b|\bearliest\b|\blatest\b|\bdays?\b|\bweeks?\b|\bmonths?\b|\byears?\b|多久|几天|几周|几个月|什么时候|之前|之后|上次|最早|最近|顺序/i;
+  /\bhow (many|long)\b|\bago\b|\bbetween\b|\border\b|\bbefore\b|\bafter\b|\bsince\b|\bfirst\b|\blast\b|\bwhen\b|\bearliest\b|\blatest\b|\bdays?\b|\bweeks?\b|\bmonths?\b|\byears?\b|\brecent(?:ly)?\b|\bpast\b|\bwhat time\b|\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b|多久|几天|几周|几个月|什么时候|之前|之后|上次|最早|最近|顺序/i;
 
 const DATE_KEY_RE = /^(\d{4}[-/]\d{2}[-/]\d{2})/;
 const MAX_GROUPS = 15;
