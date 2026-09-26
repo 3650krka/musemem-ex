@@ -114,12 +114,22 @@ export function classifyQuestion(query: string): QuestionClass {
  * CL-Bench rulebooks are unaffected — reference-document stores override the
  * class budget with the document size (isReferenceDoc path).
  *
+ * UPDATE (60K+timeline arm, temporal+multi-session, 10 questions):
+ *   60K no-TL  5/10 (temporal 1/5, multi 3/5)
+ *   60K +TL    9/10 (temporal 5/5, multi 4/5)   +4 up, 0 DOWN
+ * The timeline fixes date arithmetic ("0 weeks ago" -> "4 weeks ago") and even
+ * rescued the one gold session ranked 144th — the date lines carry the fact
+ * without the record. aggregation now matches the measured arm (60K): the
+ * +1 multi-session flip (gpt4_59c863d7, 4th session at rank 32-50) needs ~50
+ * records, and knowledge-update stayed 100% at 60K (its only regression was
+ * at 120K). default stays at 12000 for the coding track.
+ *
  * The window is not the constraint (~10K tokens << 128K): the binding
  * constraint is coverage of distributed gold, and AML's formal evaluation
  * requests top_k=100, so these budgets take effect in production.
  */
 const BUDGET_BY_CLASS: Record<QuestionClass, number> = {
-  aggregation: 40000,
+  aggregation: 60000,
   temporal: 60000,
   "personal-fact": 30000,
   "assistant-content": 30000,

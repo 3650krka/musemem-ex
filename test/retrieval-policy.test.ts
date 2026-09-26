@@ -88,7 +88,7 @@ test("class budgets follow the measured A/B calibration", () => {
   // 40K. default stays tight: coding queries land there and the coding track's
   // measured sweet spot is a ~8-12K payload.
   assert.equal(budgetForClass("temporal"), 60000);
-  assert.equal(budgetForClass("aggregation"), 40000);
+  assert.equal(budgetForClass("aggregation"), 60000);
   assert.equal(budgetForClass("personal-fact"), 30000);
   assert.equal(budgetForClass("assistant-content"), 30000);
   assert.equal(budgetForClass("default"), 12000);
