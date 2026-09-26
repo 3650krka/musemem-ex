@@ -318,6 +318,31 @@ function parseYMD(dateStr: string | undefined): DateYMD | null {
  */
 const AML_RECALL_FLOOR = Number(process.env.AML_RECALL_FLOOR ?? 0.08);
 
+/**
+ * Runtime overrides for the two knobs that decide whether a gold record reaches
+ * the payload: the recall floor (candidate-pool gate) and the char budget
+ * (payload cap). Both are read per request so a diagnostic can separate two
+ * very different failures without a redeploy:
+ *   - gold appears once the budget is raised  -> ranking/budget problem
+ *   - gold still absent with floor 0 + huge budget -> not in the candidate pool
+ *     at all, i.e. an indexing/embedding problem that no budget can fix.
+ * Null means "use the deployed default"; /policy sets and clears them.
+ */
+let ACTIVE_FLOOR_OVERRIDE: number | null = null;
+let ACTIVE_BUDGET_OVERRIDE: number | null = null;
+function effectiveFloor(): number {
+  return ACTIVE_FLOOR_OVERRIDE ?? AML_RECALL_FLOOR;
+}
+function policyState() {
+  return {
+    policy: ACTIVE_POLICY,
+    semanticWeight: ACTIVE_WEIGHT_OVERRIDE ?? "provider-calibrated",
+    recallFloor: ACTIVE_FLOOR_OVERRIDE ?? AML_RECALL_FLOOR,
+    charBudget: ACTIVE_BUDGET_OVERRIDE ?? "class-default",
+    rerank: AML_RERANK ? `on(top${AML_RERANK_TOP_N})` : "off",
+  };
+}
+
 // ---- cross-encoder rerank (xfyun xop3qwen8breranker) ----
 // The AML smoke's recall gap traces to a paraphrase / form mismatch: the query is
 // a question, the stored memory is a conversational chunk, so the gold record
@@ -456,8 +481,8 @@ async function searchPipeline(
     .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id))
     // Budget-driven recall: lower AML recall floor, not the live 0.28 gate — the
     // char budget downstream is the real precision cap (see AML_RECALL_FLOOR).
-    .filter((r) => r.score >= AML_RECALL_FLOOR);
-    console.error(`[DEBUG] afterThreshold=${ranked.length} topRanked=${ranked[0]?.score.toFixed(4)} floor=${AML_RECALL_FLOOR}`);
+    .filter((r) => r.score >= effectiveFloor());
+    console.error(`[DEBUG] afterThreshold=${ranked.length} topRanked=${ranked[0]?.score.toFixed(4)} floor=${effectiveFloor()}`);
   } catch (e) {
     console.error(`[DEBUG] Phase3 CRASH: ${(e as Error).message?.slice(0, 200)}`);
     ranked = [];
@@ -579,11 +604,11 @@ async function searchPipeline(
   const singleVoice = assistantRecords / Math.max(1, pool.length) < 0.2;
   const isReferenceDoc = distinctSessions <= 2 && poolChars > 20000 && singleVoice;
   const envBudget = Number(process.env.AML_CHAR_BUDGET ?? 0);
-  const CHAR_BUDGET = envBudget > 0
+  const CHAR_BUDGET = ACTIVE_BUDGET_OVERRIDE ?? (envBudget > 0
     ? envBudget
     : isReferenceDoc
       ? Math.min(poolChars + 4000, 80000)
-      : (policy === "v1" ? 8000 : budgetForClass(qClass));
+      : (policy === "v1" ? 8000 : budgetForClass(qClass)));
   if (isReferenceDoc) {
     console.error(`[DEBUG] reference-document store: sessions=${distinctSessions} poolChars=${poolChars} asstFrac=${(assistantRecords / Math.max(1, pool.length)).toFixed(2)} budget=${CHAR_BUDGET}`);
   }
@@ -860,15 +885,17 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   if (path === "/policy") {
     if (req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        policy: ACTIVE_POLICY,
-        semanticWeight: ACTIVE_WEIGHT_OVERRIDE ?? "provider-calibrated",
-      }));
+      res.end(JSON.stringify(policyState()));
       return;
     }
     if (req.method === "POST") {
       try {
-        const p = JSON.parse(body) as { policy?: string; semanticWeight?: number | null };
+        const p = JSON.parse(body) as {
+          policy?: string;
+          semanticWeight?: number | null;
+          recallFloor?: number | null;
+          charBudget?: number | null;
+        };
         if (p.policy !== undefined && (KNOWN_POLICIES as readonly string[]).includes(p.policy)) {
           ACTIVE_POLICY = p.policy as Policy;
           console.log(`[POLICY] switched to ${ACTIVE_POLICY}`);
@@ -889,11 +916,30 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
           }
           console.log(`[POLICY] semanticWeight override → ${ACTIVE_WEIGHT_OVERRIDE ?? "provider-calibrated"}`);
         }
+        // Diagnostic overrides for the recall-floor / char-budget experiment.
+        // null clears back to the deployed default.
+        if ("recallFloor" in p) {
+          if (p.recallFloor === null) ACTIVE_FLOOR_OVERRIDE = null;
+          else if (typeof p.recallFloor === "number" && Number.isFinite(p.recallFloor) && p.recallFloor >= 0) ACTIVE_FLOOR_OVERRIDE = p.recallFloor;
+          else {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "recallFloor must be a finite number >= 0, or null to clear" }));
+            return;
+          }
+          console.log(`[POLICY] recallFloor override → ${ACTIVE_FLOOR_OVERRIDE ?? AML_RECALL_FLOOR}`);
+        }
+        if ("charBudget" in p) {
+          if (p.charBudget === null) ACTIVE_BUDGET_OVERRIDE = null;
+          else if (typeof p.charBudget === "number" && Number.isFinite(p.charBudget) && p.charBudget > 0) ACTIVE_BUDGET_OVERRIDE = p.charBudget;
+          else {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "charBudget must be a finite number > 0, or null to clear" }));
+            return;
+          }
+          console.log(`[POLICY] charBudget override → ${ACTIVE_BUDGET_OVERRIDE ?? "class-default"}`);
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          policy: ACTIVE_POLICY,
-          semanticWeight: ACTIVE_WEIGHT_OVERRIDE ?? "provider-calibrated",
-        }));
+        res.end(JSON.stringify(policyState()));
       } catch (e) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: (e as Error).message }));
