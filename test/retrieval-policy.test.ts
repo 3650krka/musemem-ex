@@ -80,16 +80,27 @@ test("unclassifiable queries fall back to default", () => {
 
 // ---- adaptive budget ----
 
-test("aggregation gets the largest budget, default the smallest", () => {
+test("class budgets follow the measured A/B calibration", () => {
+  // Budget A/B on LongMemEval-S (identical questions, only budget varied):
+  //   12K/30K/60K -> 50% / 70% / 75% overall, ZERO down-flips in 30 questions.
+  // temporal is now the widest class because its accuracy only moved at 60K
+  // (20% -> 40%) while multi-session was flat 30K -> 60K, so aggregation keeps
+  // 40K. default stays tight: coding queries land there and the coding track's
+  // measured sweet spot is a ~8-12K payload.
+  assert.equal(budgetForClass("temporal"), 60000);
+  assert.equal(budgetForClass("aggregation"), 40000);
+  assert.equal(budgetForClass("personal-fact"), 30000);
+  assert.equal(budgetForClass("assistant-content"), 30000);
+  assert.equal(budgetForClass("default"), 12000);
   const agg = budgetForClass("aggregation");
   const temp = budgetForClass("temporal");
   const pers = budgetForClass("personal-fact");
   const dflt = budgetForClass("default");
-  assert.ok(agg > temp, "aggregation budget exceeds temporal");
-  assert.ok(temp > pers, "temporal budget exceeds personal-fact");
+  assert.ok(temp >= agg, "temporal needs the widest net (interval endpoints)");
+  assert.ok(agg > pers, "aggregation budget exceeds personal-fact");
   assert.ok(pers > dflt, "personal-fact budget exceeds default");
   // All budgets stay well inside a 128K-token answer window.
-  assert.ok(agg <= 60000, "aggregation budget stays bounded");
+  assert.ok(temp <= 60000, "temporal budget stays bounded");
 });
 
 // ---- user char share ----

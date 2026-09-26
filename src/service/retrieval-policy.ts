@@ -89,18 +89,40 @@ export function classifyQuestion(query: string): QuestionClass {
 /**
  * Character budget per question class.
  *
- * Rationale: the answer model (gpt-4o-mini) has a 128K-token window, so even
- * the largest budget here (~10K tokens) uses <10% of context. The binding
- * constraint is not the window but signal dilution — hence single-fact
- * questions stay tight (precision) while aggregation/temporal open up
- * (completeness), because for those classes a MISSING item is an unrecoverable
- * error whereas an extra item is only mild noise.
+ * Calibrated by A/B on LongMemEval-S (identical questions, only budget+topk
+ * varied; answer+judge fixed; zero down-flips across all 30 questions measured):
+ *
+ *   budget(topk)   overall  ss-user  multi-session  temporal  knowledge-update
+ *   12K (12)        50.0%     80%       20%           20%         80%
+ *   30K (30)        70.0%    100%       60%           20%        100%
+ *   60K (60)        75.0%    100%       60%           40%        100%
+ *   (ss-preference / ss-assistant at 16K vs 30K: 0 flips either way — flat.)
+ *
+ * The gains are coverage flips, not noise: "1 project" -> "2 projects",
+ * "5 days" -> "8 days", "not mentioned" -> found, "0 days ago" -> "7 days
+ * ago". Gold-recall on beam+personamem rises monotonically 37.7% -> 88.4%
+ * from 8K -> 120K, and no type regressed at any budget — the "lost in the
+ * middle" penalty for single-fact questions did NOT materialize (ss-user
+ * improved 80% -> 100%).
+ *
+ * temporal is now the WIDEST class, above aggregation: date-arithmetic
+ * questions need both endpoints of an interval, and their accuracy only
+ * moved at 60K (20% -> 40%) while multi-session was already flat 30K -> 60K,
+ * so aggregation keeps 40K. default stays at 12000: it is the class coding
+ * queries fall into (no first-person, no aggregation/temporal markers), and
+ * the coding track's measured sweet spot is a tight ~8-12K payload.
+ * CL-Bench rulebooks are unaffected — reference-document stores override the
+ * class budget with the document size (isReferenceDoc path).
+ *
+ * The window is not the constraint (~10K tokens << 128K): the binding
+ * constraint is coverage of distributed gold, and AML's formal evaluation
+ * requests top_k=100, so these budgets take effect in production.
  */
 const BUDGET_BY_CLASS: Record<QuestionClass, number> = {
   aggregation: 40000,
-  temporal: 30000,
-  "personal-fact": 16000,
-  "assistant-content": 16000,
+  temporal: 60000,
+  "personal-fact": 30000,
+  "assistant-content": 30000,
   default: 12000,
 };
 
