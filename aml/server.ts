@@ -269,24 +269,23 @@ function ingestMessages(
 
   for (const m of messages) {
     const line = `${m.role}: ${m.content}`;
-    // Oversized single message (e.g. a CL-Bench rulebook of 80-110K chars sent as
-    // ONE user turn). The old loop never split it: it became one giant record, and
-    // at search time the char-budget loop DROPPED it (totalChars + len > CHAR_BUDGET
-    // → break), so the content was stored but never retrievable. Split it into
-    // RECORD_CHARS pieces at paragraph/line/space boundaries so it stays searchable.
+    // A message is an ATOMIC record unit — NEVER split it. AML's smoke checks
+    // that every expected Search record (the message as the platform sent it)
+    // appears in our results; splitting a >RECORD_CHARS message (a CL-Bench
+    // rulebook of 4-36K chars, a 1295-char beam turn) left NO single record
+    // containing it — measured 7-67% best single-record containment — which is
+    // exactly the smoke failure "expected=18, actual=11" (6 of the 7 missing
+    // were CL-Bench rulebook/task messages, the 7th a long beam turn).
+    // The original reason for splitting — the budget loop dropping a giant
+    // record mid-list — is now handled two ways below: the isReferenceDoc
+    // detection sizes the budget to the document, and the budget loop always
+    // admits the TOP-RANKED evidence record even when it alone exceeds the
+    // budget. Short messages still join into <=RECORD_CHARS records (a joined
+    // record still CONTAINS each message verbatim, so the check keeps passing).
     if (line.length > RECORD_CHARS) {
       if (buf.length) flush();
-      let rest = line;
-      while (rest.length > RECORD_CHARS) {
-        let cut = rest.lastIndexOf("\n\n", RECORD_CHARS);
-        if (cut < RECORD_CHARS * 0.4) cut = rest.lastIndexOf("\n", RECORD_CHARS);
-        if (cut < RECORD_CHARS * 0.4) cut = rest.lastIndexOf(" ", RECORD_CHARS);
-        if (cut < RECORD_CHARS * 0.3) cut = RECORD_CHARS;
-        buf.push(rest.slice(0, cut));
-        flush(); // each piece is its own record (with the date/session header)
-        rest = rest.slice(cut).replace(/^\n+/, "");
-      }
-      if (rest.trim()) { buf.push(rest); len = rest.length; }
+      buf.push(line); len = line.length;
+      flush(); // one whole-message record
       continue;
     }
     if (len + line.length > RECORD_CHARS && buf.length) flush();
@@ -630,6 +629,12 @@ async function searchPipeline(
   let totalChars = results.reduce((s, r) => s + r.content.length, 0);
   const seenContent = new Set<string>();
   let duplicatesSkipped = 0;
+  // Evidence records admitted by the loop (synthetic injections above are not
+  // counted). The top-ranked evidence record is ALWAYS admitted, even when it
+  // alone exceeds CHAR_BUDGET — that is the companion fix to atomic messages:
+  // a 36K rulebook message becomes one record, and dropping it would make the
+  // whole document unretrievable (the exact failure the old split worked around).
+  let evidenceEmitted = 0;
   for (const r of finalRanked) {
     if (results.length >= topK) break;
     // v1 policy: no dedup (A/B baseline)
@@ -637,7 +642,8 @@ async function searchPipeline(
       if (seenContent.has(r.record.content)) { duplicatesSkipped++; continue; }
       seenContent.add(r.record.content);
     }
-    if (totalChars + r.record.content.length > CHAR_BUDGET && results.length > 0) break;
+    if (totalChars + r.record.content.length > CHAR_BUDGET && evidenceEmitted > 0) break;
+    evidenceEmitted += 1;
     totalChars += r.record.content.length;
     results.push({
       id: r.record.id,
