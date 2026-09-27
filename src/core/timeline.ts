@@ -95,7 +95,7 @@ export function buildTimelineIndex(records: readonly MemoryRecord[], opts: Timel
   const anchors: string[] = [];
   if (opts.today) anchors.push(`today = ${String(opts.today).split(" ")[0].replace(/\//g, "-")}`);
   if (opts.currentTurn !== undefined) anchors.push(`now = turn ${opts.currentTurn}`);
-  const header = `[Timeline — chronological PARTIAL index of the memories below, one line per ${dateEntries.length ? "date" : "turn"}${anchors.length ? `; ${anchors.join("; ")}` : ""}. Not every record is listed — if an event you need is absent here, search the full memory text below before concluding it was never mentioned.]`;
+  const header = `[Timeline — chronological PARTIAL index of the accompanying memories, one line per ${dateEntries.length ? "date" : "turn"}${anchors.length ? `; ${anchors.join("; ")}` : ""}. Not every record is listed — if an event you need is absent here, search the full memory text before concluding it was never mentioned.]`;
 
   let text = header + "\n" + lines.join("\n");
   if (opts.maxChars !== undefined && text.length > opts.maxChars) {

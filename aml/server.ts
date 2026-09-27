@@ -527,31 +527,32 @@ async function searchPipeline(
 
   const results: Array<{ id: string; content: string; score: number; created_at: string }> = [];
 
-  // v3: self-initiated disclosure extraction. Placed FIRST because it carries
-  // the verbatim clause that answers the question; every measured failure had
-  // its gold buried mid-record while already ranking 1-6. Fail-closed: with no
-  // marked disclosure the block is omitted and the injection is unchanged.
+  // Derived aids (disclosure / timeline / counting / contrast / persona) are
+  // collected SEPARATELY and appended AFTER the source evidence. A passing AML
+  // implementation returns evidence-first with no synthetic records, and the
+  // integrity rule forbids presenting derived content as if it were a retrieved
+  // memory. These aids are deterministic, zero-LLM transformations OF the
+  // evidence (verbatim quotes, a chronological index, a countable fact list) —
+  // auxiliary indices over the memories, not original memories — so they ride
+  // at the end where they help the answer model without displacing or
+  // impersonating a source record at data[0]. Persona, the only true inference,
+  // rides last.
+  const aids: Array<{ id: string; content: string; score: number; created_at: string }> = [];
+  const now = () => new Date().toISOString();
+
+  // v3: self-initiated disclosure extraction. Carries the verbatim clause that
+  // answers the question; fail-closed when no marked disclosure exists.
   if (policy === "v3") {
     try {
       const block = renderDisclosureBlock(extractDisclosures(ranked));
       if (block) {
-        results.push({ id: "volunteered_asides", content: block, score: 0.9995, created_at: new Date().toISOString() });
+        aids.push({ id: "volunteered_asides", content: block, score: 0.9995, created_at: now() });
         console.error(`[DEBUG] disclosures blockChars=${block.length} lines=${block.split("\n").length - 2}`);
       }
     } catch (e) {
       console.error(`[DEBUG] disclosure FAIL: ${(e as Error).message?.slice(0, 100)}`);
     }
   }
-
-  // Persona injection: deterministic user profile from topic frequency.
-  // Fail-closed: persona construction must never break the search.
-  try {
-    const personaEntries = buildPersona(pool, scope.turns + 1);
-    const personaText = renderPersona(personaEntries);
-    if (personaText) {
-      results.push({ id: "persona_profile", content: personaText, score: 0.995, created_at: new Date().toISOString() });
-    }
-  } catch { /* persona is best-effort */ }
 
   // timeline index for temporal questions (same as bench TIMELINE_ENABLED)
   if (TEMPORAL_PROMPT_RE.test(query) && ranked.length >= 2) {
@@ -560,38 +561,49 @@ async function searchPipeline(
       { currentTurn: scope.turns + 1, maxChars: 2000 },
     );
     if (tl) {
-      results.push({ id: "timeline_index", content: tl, score: 1.0, created_at: new Date().toISOString() });
+      aids.push({ id: "timeline_index", content: tl, score: 1.0, created_at: now() });
     }
     // Explicit reference date for temporal computation — the answer model
     // needs to know "today" to compute "how many days/weeks/months ago".
-    // Without this, the model defaults to its training cutoff (2024-01).
     if (questionDate) {
-      results.push({
+      aids.push({
         id: "temporal_anchor",
         content: `[Reference date: ${questionDate}. Compute all time differences from this date.]`,
         score: 0.999,
-        created_at: new Date().toISOString(),
+        created_at: now(),
       });
     }
   }
 
-  // contrast lines (pattern separation)
+  // Counting aid for "how many" questions — re-presents the relevant SOURCE
+  // facts as a numbered list so the model can count them (it does NOT compute
+  // the answer).
+  const countingAid = buildCountingAid(query, ranked);
+  if (countingAid) {
+    aids.push({ id: "counting_aid", content: countingAid, score: 0.998, created_at: now() });
+  }
+
+  // contrast lines (pattern separation) — discriminative tokens of confusable
+  // source pairs. Header makes clear this is an index over the memories, not a
+  // memory itself.
   const contrasts = renderContrastLines(
     ranked.slice(0, 20).map((r) => r.record),
     { confusableThreshold: 0.5, maxContrasts: 4 },
   );
   if (contrasts.length) {
-    results.push({ id: "contrast_pairs", content: contrasts.join("\n"), score: 0.99, created_at: new Date().toISOString() });
+    const body = "[Contrast index — distinguishing similar memories above; an auxiliary index, not an original memory]\n" + contrasts.join("\n");
+    aids.push({ id: "contrast_pairs", content: body, score: 0.99, created_at: now() });
   }
 
-  // Counting aid for "how many" questions (cognitive basis: Miller 1956 —
-  // working memory can't count 80+ raw memories; external aid offloads it).
-  // The aid SUPPLEMENTS the evidence; it never replaces it, because a count
-  // is only as complete as the records behind it.
-  const countingAid = buildCountingAid(query, ranked);
-  if (countingAid) {
-    results.push({ id: "counting_aid", content: countingAid, score: 0.998, created_at: new Date().toISOString() });
-  }
+  // Persona injection — the ONLY true inference here (not traceable to a single
+  // source statement), so it rides LAST among the aids. Fail-closed.
+  try {
+    const personaEntries = buildPersona(pool, scope.turns + 1);
+    const personaText = renderPersona(personaEntries);
+    if (personaText) {
+      aids.push({ id: "persona_profile", content: personaText, score: 0.995, created_at: now() });
+    }
+  } catch { /* persona is best-effort */ }
 
   // Evidence records, with two budget protections:
   //  - adaptive char budget by question class (aggregation needs completeness,
@@ -639,11 +651,10 @@ async function searchPipeline(
   if (isReferenceDoc) {
     console.error(`[DEBUG] reference-document store: sessions=${distinctSessions} poolChars=${poolChars} budget=${CHAR_BUDGET}`);
   }
-  // Synthetic injections (persona/timeline/counting-aid/contrasts above) are
-  // auxiliary aids, NOT evidence. They must not consume the budget that decides
-  // whether a source record is emitted. Count evidence chars separately so a
-  // fixed ~2-4K of aids never displaces a record the evaluator expects.
-  let totalChars = results.reduce((s, r) => s + r.content.length, 0);
+  // The derived aids collected above ride in `aids`, appended AFTER the source
+  // evidence. The char budget governs EVIDENCE only; aids are auxiliary and a
+  // fixed ~2-4K of them never displaces a source record the evaluator expects.
+  let totalChars = 0;
   const seenContent = new Set<string>();
   let duplicatesSkipped = 0;
   // Evidence records admitted by the loop (synthetic injections above are not
@@ -671,7 +682,17 @@ async function searchPipeline(
       created_at: new Date().toISOString(),
     });
   }
-  console.error(`[DEBUG] emitted=${results.length} chars=${totalChars}/${CHAR_BUDGET} dedupSkipped=${duplicatesSkipped}`);
+  // Append the derived aids AFTER the source evidence, so source memory always
+  // occupies data[0..N]. Aids are auxiliary indices over the memories above and
+  // never displace or impersonate a source record; persona rides last.
+  let aidsAppended = 0;
+  for (const a of aids) {
+    if (results.length >= topK) break;
+    results.push(a);
+    totalChars += a.content.length;
+    aidsAppended += 1;
+  }
+  console.error(`[DEBUG] emitted=${results.length} (evidence=${evidenceEmitted} aids=${aidsAppended}) chars=${totalChars}/${CHAR_BUDGET} dedupSkipped=${duplicatesSkipped}`);
 
   return results;
 }
