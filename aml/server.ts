@@ -252,47 +252,26 @@ function ingestMessages(
   scope.turns += 1;
   const turn = scope.turns;
 
-  let buf: string[] = [];
-  let len = 0;
-  const flush = () => {
-    if (!buf.length) return;
-    const content = date
-      ? `[${date}] (session ${sessionId})\n${buf.join("\n")}`
-      : buf.join("\n");
+  // One record per message. A passing AML implementation stores evidence
+  // per-message (no joining): the smoke checks that each expected record — the
+  // message as the platform sent it — appears as a retrievable record, and a
+  // joined multi-message record buries the individual messages inside a larger
+  // blob. A message is never split either: a >RECORD_CHARS message (a CL-Bench
+  // rulebook of 4-36K chars, a 1295-char beam turn) is a single whole record,
+  // which the reference-document budget path and the always-admit-top-record
+  // guard accommodate. Per-message date keeps the temporal axis faithful when a
+  // chunk spans dates.
+  for (const m of messages) {
+    const mts = m.timestamp;
+    const mdate = mts ? new Date(mts > 1e12 ? mts : mts * 1000).toISOString().split("T")[0] : date;
+    const line = `${m.role}: ${m.content}`;
+    const content = mdate ? `[${mdate}] (session ${sessionId})\n${line}` : line;
     scope.store.appendEvidence(sessScope, baseRecord(
       recordId(sessionId, scope.recordCount),
-      content, turn, { sessionId, date },
+      content, turn, { sessionId, date: mdate },
     ));
     scope.recordCount += 1;
-    buf = []; len = 0;
-  };
-
-  for (const m of messages) {
-    const line = `${m.role}: ${m.content}`;
-    // A message is an ATOMIC record unit — NEVER split it. AML's smoke checks
-    // that every expected Search record (the message as the platform sent it)
-    // appears in our results; splitting a >RECORD_CHARS message (a CL-Bench
-    // rulebook of 4-36K chars, a 1295-char beam turn) left NO single record
-    // containing it — measured 7-67% best single-record containment — which is
-    // exactly the smoke failure "expected=18, actual=11" (6 of the 7 missing
-    // were CL-Bench rulebook/task messages, the 7th a long beam turn).
-    // The original reason for splitting — the budget loop dropping a giant
-    // record mid-list — is now handled two ways below: the isReferenceDoc
-    // detection sizes the budget to the document, and the budget loop always
-    // admits the TOP-RANKED evidence record even when it alone exceeds the
-    // budget. Short messages still join into <=RECORD_CHARS records (a joined
-    // record still CONTAINS each message verbatim, so the check keeps passing).
-    if (line.length > RECORD_CHARS) {
-      if (buf.length) flush();
-      buf.push(line); len = line.length;
-      flush(); // one whole-message record
-      continue;
-    }
-    if (len + line.length > RECORD_CHARS && buf.length) flush();
-    buf.push(line);
-    len += line.length;
   }
-  flush();
 }
 
 // ---- search — EXACT COPY of bench/aml-text/run.ts searchMemories() ----
