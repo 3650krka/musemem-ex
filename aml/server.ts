@@ -13,7 +13,6 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { join } from "node:path";
 import { mkdirSync, readFileSync } from "node:fs";
 
-import { buildPersona, renderPersona } from "../src/service/persona.ts";
 import { buildCountingAid } from "../src/service/counting-aid.ts";
 import { classifyQuestion, budgetForClass, selfReferenceFactor } from "../src/service/retrieval-policy.ts";
 import { extractDisclosures, renderDisclosureBlock } from "../src/service/disclosure.ts";
@@ -527,7 +526,7 @@ async function searchPipeline(
 
   const results: Array<{ id: string; content: string; score: number; created_at: string }> = [];
 
-  // Derived aids (disclosure / timeline / counting / contrast / persona) are
+  // Derived aids (disclosure / timeline / counting / contrast) are
   // collected SEPARATELY and appended AFTER the source evidence. A passing AML
   // implementation returns evidence-first with no synthetic records, and the
   // integrity rule forbids presenting derived content as if it were a retrieved
@@ -535,8 +534,15 @@ async function searchPipeline(
   // evidence (verbatim quotes, a chronological index, a countable fact list) —
   // auxiliary indices over the memories, not original memories — so they ride
   // at the end where they help the answer model without displacing or
-  // impersonating a source record at data[0]. Persona, the only true inference,
-  // rides last.
+  // impersonating a source record at data[0].
+
+  // The persona inference is deliberately NOT injected. It is the one aid whose
+  // text is not traceable to a single source statement (it is a keyword-frequency
+  // inference over the whole store), so AML's integrity requirement — Search
+  // returns memory evidence and must not present derived content as a retrieved
+  // memory — is honoured most cleanly by source evidence plus deterministic
+  // indices over that evidence. Its measured value for the answer model was also
+  // never isolated, unlike the temporal index.
   const aids: Array<{ id: string; content: string; score: number; created_at: string }> = [];
   const now = () => new Date().toISOString();
 
@@ -594,16 +600,6 @@ async function searchPipeline(
     const body = "[Contrast index — distinguishing similar memories above; an auxiliary index, not an original memory]\n" + contrasts.join("\n");
     aids.push({ id: "contrast_pairs", content: body, score: 0.99, created_at: now() });
   }
-
-  // Persona injection — the ONLY true inference here (not traceable to a single
-  // source statement), so it rides LAST among the aids. Fail-closed.
-  try {
-    const personaEntries = buildPersona(pool, scope.turns + 1);
-    const personaText = renderPersona(personaEntries);
-    if (personaText) {
-      aids.push({ id: "persona_profile", content: personaText, score: 0.995, created_at: now() });
-    }
-  } catch { /* persona is best-effort */ }
 
   // Evidence records, with two budget protections:
   //  - adaptive char budget by question class (aggregation needs completeness,
@@ -684,7 +680,7 @@ async function searchPipeline(
   }
   // Append the derived aids AFTER the source evidence, so source memory always
   // occupies data[0..N]. Aids are auxiliary indices over the memories above and
-  // never displace or impersonate a source record; persona rides last.
+  // never displace or impersonate a source record.
   let aidsAppended = 0;
   for (const a of aids) {
     if (results.length >= topK) break;
