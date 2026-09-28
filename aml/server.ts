@@ -249,6 +249,41 @@ function baseRecord(id: string, content: string, turn: number, meta: Record<stri
   };
 }
 
+/**
+ * Reassemble platform-split documents. Evidence from the live smoke stores
+ * (/peek on the platform user): the platform sends a long document as
+ * consecutive messages marked "[part 1/2]", "[part 2/2]" (an 8,083+3,262-char
+ * CL-Bench paper). Storing each part as its own atomic record meant a 12K
+ * budget could return HALF a document — the answer model never saw the data
+ * table in part 2, a plausible cause of G2=20.00, G4=0.00 and F1=0.00 while
+ * retrieval itself located the right record. Adjacent same-document parts are
+ * merged back into one message so one record contains the whole document.
+ * Stores without "[part k/m]" markers are untouched, byte for byte.
+ */
+export function stitchPartMessages(
+  messages: Array<{ role: string; content: string; timestamp?: number }>,
+): Array<{ role: string; content: string; timestamp?: number }> {
+  const PART = /\[part (\d+)\/(\d+)\]/;
+  const out: Array<{ role: string; content: string; timestamp?: number }> = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    const pm = typeof m.content === "string" ? m.content.match(PART) : null;
+    if (!pm || !pm.index) { out.push(m); continue; }
+    const key = m.content.slice(0, pm.index).trim();
+    let cur = Number(pm[1]);
+    const total = Number(pm[2]);
+    let text = m.content;
+    while (cur < total && i + 1 < messages.length) {
+      const nx = typeof messages[i + 1].content === "string" ? messages[i + 1].content.match(PART) : null;
+      if (!nx || messages[i + 1].content.slice(0, nx.index).trim() !== key || Number(nx[1]) !== cur + 1) break;
+      i += 1; cur = Number(nx[1]);
+      text += "\n" + messages[i].content;
+    }
+    out.push({ ...m, content: text });
+  }
+  return out;
+}
+
 function ingestMessages(
   messages: Array<{ role: string; content: string; timestamp?: number }>,
   scope: Scope,
@@ -891,7 +926,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           scope = scopeFor(payload.user_id);
-          ingestMessages(payload.messages, scope, payload.user_id, payload.session_id);
+          ingestMessages(stitchPartMessages(payload.messages), scope, payload.user_id, payload.session_id);
           storeErr = null;
           break;
         } catch (e) {

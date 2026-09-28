@@ -94,7 +94,19 @@ const STORES = {
     ["s1", ["2024-09-01"], [["I am learning Rust with the ownership book", "Rust ownership is worth the pain"]]],
     ["s2", ["2024-09-15"], [["I switched to Go now, my team standardised on it", "Go is a pragmatic team choice"]]],
   ]},
+  // platform-split document: arrives as consecutive [part 1/2] + [part 2/2]
+  // messages sharing one prefix, exactly like the live CL-Bench store
+  s_parts: { chunks: [["s1", ["2024-01-02"], []]] },
 };
+function buildPartMessages() {
+  const head = "user: [ab-p][session_1][D1:2][text] user: ";
+  const p1 = head + "[part 1/2] Background of the study: samples were prepared and measured " + "alpha ".repeat(1600);
+  const p2 = head + "[part 2/2] Results table: UNIQUE-ACRONYM-ZQX uptake reached 42 percent " + "beta ".repeat(1600);
+  return [
+    { role: "user", content: p1, timestamp: Date.parse("2024-01-02T10:00:00Z") },
+    { role: "user", content: p2, timestamp: Date.parse("2024-01-02T10:00:00Z") },
+  ];
+}
 
 const QUERIES = [
   ["s_life", "What is my current main exercise: yoga or pilates?"],
@@ -125,12 +137,15 @@ const QUERIES = [
   ["s_stream", "What did my team standardise on?"],
   ["s_life", "Summarise everything important about my life across all sessions."],
   ["s_refdoc", "Which thresholds need supervisory sign off?"],
+  ["s_parts", "What UNIQUE-ACRONYM-ZQX uptake was reported?"],
+  ["s_parts", "Summarise the whole study including background and results."],
 ];
-// The ONLY queries allowed to change between base and current.
-const EXPECTED_CHANGE = new Set([
-  's_coding|the retry backoff logic in handler.go is wrong, fix the rate limiting',
-  's_coding|add graceful cancellation to the worker loop in mod3',
-]);
+// Queries allowed to change between base and current, passed per run:
+//   AML_AB_EXPECT="store|query;store|query;..."
+// Empty means a pure no-drift check (the common case for unrelated changes).
+const EXPECTED_CHANGE = new Set(
+  (process.env.AML_AB_EXPECT ?? "").split(";").map((s) => s.trim()).filter(Boolean),
+);
 
 // ---- runner -----------------------------------------------------------------
 async function waitFor(port, ms) {
@@ -154,11 +169,12 @@ async function runSuite(label, port, dataDir) {
   const results = [];
   for (const [store, cfg] of Object.entries(STORES)) {
     for (const [sess, dates, body] of cfg.chunks) {
+      const messages = store === "s_parts" ? buildPartMessages() : mkMsgs(sess, dates, body);
       try {
         const t1 = Date.now();
         const ra = await fetch(`http://127.0.0.1:${port}/add`, {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ request_id: `ab:${label}:${store}:${sess}`, user_id: `local:ab:${label}:${store}`, session_id: sess, messages: mkMsgs(sess, dates, body) }),
+          body: JSON.stringify({ request_id: `ab:${label}:${store}:${sess}`, user_id: `local:ab:${label}:${store}`, session_id: sess, messages }),
         });
         console.log(`add ${label}/${store}/${sess} -> ${ra.status} in ${Date.now() - t1}ms`);
         if (!ra.ok) console.log("  body:", (await ra.text()).slice(0, 200));
