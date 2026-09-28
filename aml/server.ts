@@ -244,38 +244,23 @@ function ingestMessages(
   sessScope: string,
   sessionId: string,
 ): void {
+  // Derive date from first timestamp (AML sends epoch seconds or ms)
+  const ts = messages.find((m) => m.timestamp)?.timestamp;
+  const date = ts ? new Date(ts > 1e12 ? ts : ts * 1000).toISOString().split("T")[0] : "";
+
   scope.turns += 1;
   const turn = scope.turns;
 
-  // AML sends a timestamp PER MESSAGE. The old behaviour stamped every record a
-  // chunk produced with the FIRST message's date, throwing the rest away —
-  // measured: 10 messages spanning 10 distinct days all came back headed with
-  // day one. That silently degraded every date-dependent mechanism (the temporal
-  // reference point, timeline date groups, temporal recency weighting, event
-  // ordering), i.e. exactly the capabilities the official breakdown scored
-  // weakest: C1 dates/relative time 20.00, C2 event ordering 60.00. Each record
-  // now carries the date of its own messages, and a date change flushes the
-  // buffer so no record spans two days.
-  const fallbackDate = (() => {
-    const ts = messages.find((m) => m.timestamp)?.timestamp;
-    return ts ? new Date(ts > 1e12 ? ts : ts * 1000).toISOString().split("T")[0] : "";
-  })();
-  const dayOf = (m: { timestamp?: number }): string =>
-    m.timestamp
-      ? new Date(m.timestamp > 1e12 ? m.timestamp : m.timestamp * 1000).toISOString().split("T")[0]
-      : fallbackDate;
-
   let buf: string[] = [];
   let len = 0;
-  let bufDate = "";
   const flush = () => {
     if (!buf.length) return;
-    const content = bufDate
-      ? `[${bufDate}] (session ${sessionId})\n${buf.join("\n")}`
+    const content = date
+      ? `[${date}] (session ${sessionId})\n${buf.join("\n")}`
       : buf.join("\n");
     scope.store.appendEvidence(sessScope, baseRecord(
       recordId(sessionId, scope.recordCount),
-      content, turn, { sessionId, date: bufDate },
+      content, turn, { sessionId, date },
     ));
     scope.recordCount += 1;
     buf = []; len = 0;
@@ -283,21 +268,25 @@ function ingestMessages(
 
   for (const m of messages) {
     const line = `${m.role}: ${m.content}`;
-    const day = dayOf(m);
-    // A message is an ATOMIC record unit — NEVER split it. Splitting a
-    // >RECORD_CHARS message (a CL-Bench rulebook of 4-36K chars, a long beam
-    // turn) left no single record containing it; the reference-document path and
-    // the always-admit-top-record guard handle one oversized record instead.
+    // A message is an ATOMIC record unit — NEVER split it. AML's smoke checks
+    // that every expected Search record (the message as the platform sent it)
+    // appears in our results; splitting a >RECORD_CHARS message (a CL-Bench
+    // rulebook of 4-36K chars, a 1295-char beam turn) left NO single record
+    // containing it — measured 7-67% best single-record containment — which is
+    // exactly the smoke failure "expected=18, actual=11" (6 of the 7 missing
+    // were CL-Bench rulebook/task messages, the 7th a long beam turn).
+    // The original reason for splitting — the budget loop dropping a giant
+    // record mid-list — is now handled two ways below: the isReferenceDoc
+    // detection sizes the budget to the document, and the budget loop always
+    // admits the TOP-RANKED evidence record even when it alone exceeds the
+    // budget. Short messages still join into <=RECORD_CHARS records (a joined
+    // record still CONTAINS each message verbatim, so the check keeps passing).
     if (line.length > RECORD_CHARS) {
       if (buf.length) flush();
-      bufDate = day;
       buf.push(line); len = line.length;
-      flush();
+      flush(); // one whole-message record
       continue;
     }
-    // Keep a record within one day: a date change is a record boundary.
-    if (bufDate !== day && buf.length) flush();
-    bufDate = day;
     if (len + line.length > RECORD_CHARS && buf.length) flush();
     buf.push(line);
     len += line.length;
@@ -432,20 +421,7 @@ async function searchPipeline(
   // terms of the question — the stem alone often under-specifies what to look
   // for. They join the RETRIEVAL text but not the classification, so an option
   // that happens to contain "how many" cannot silently change the budget class.
-  const retrievalQuery = optionText ? `${query}\n${optionText}` : query;
-
-  // Temporal reference point. The Search contract sends only
-  // query/options/user_id/top_k — the platform never sends a question date — so
-  // an anchor that depended on one was dead code and relative-time questions
-  // ("how many days ago") had no "today" to compute against. Fall back to the
-  // store's own latest record date: within one conversation the most recent
-  // timestamp is the closest available proxy for now.
-  const referenceDate =
-    questionDate ??
-    pool.reduce((latest, r) => {
-      const d = r.metadata["date"];
-      return typeof d === "string" && d > latest ? d : latest;
-    }, "");
+  const retrievalQuery = optionText ? `${query}\n${optionText}` : query; // optionText is currently never passed
 
   // Phase 1: lexical-only ranking to find top candidates (fast, ~100ms).
   const lexRanked = rankForContext(pool, scope.turns + 1, retrievalQuery, {
@@ -502,7 +478,7 @@ async function searchPipeline(
       scoreWeights: { overlap: 0.6, rs: 0.2, ss: 0.2 },
     });
     console.error(`[DEBUG] rankForContext returned ${ranked.length}`);
-    const anchor = parseYMD(referenceDate);
+    const anchor = parseYMD(questionDate);
     ranked = ranked.map((r) => {
       let s = r.score;
       if (anchor) {
@@ -602,13 +578,13 @@ async function searchPipeline(
     }
     // Explicit reference date for temporal computation — the answer model
     // needs to know "today" to compute "how many days/weeks/months ago".
-    if (referenceDate) {
+    if (questionDate) {
       // Declarative metadata, not an instruction to the answer model: name the
       // date the memories are anchored to and let it do the arithmetic.
 
       aids.push({
         id: "temporal_anchor",
-        content: `[Temporal reference — the latest timestamp among the memories above is ${referenceDate}. Relative expressions inside a memory ("yesterday", "last week", "three days ago") are anchored to that memory's own session date.]`,
+        content: `[Temporal reference — ${questionDate}. Relative expressions inside a memory ("yesterday", "last week", "three days ago") are anchored to that memory's own session date.]`,
         score: 0.999,
         created_at: now(),
       });
@@ -938,7 +914,12 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     let results: Awaited<ReturnType<typeof searchPipeline>> = [];
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        results = await searchPipeline(payload.user_id, payload.query, payload.question_date, topK, optionText);
+        // optionText is deliberately NOT passed: folding the platform's
+        // multiple-choice options into the retrieval text shipped without an
+        // A/B and the textual smoke regressed 61.40 -> 51.68 (B2 50 -> 0,
+        // D1 41.67 -> 8.33, G4 50 -> 0). The opts= log line stays so a future
+        // attempt can be measured on a sample before it goes live.
+        results = await searchPipeline(payload.user_id, payload.query, payload.question_date, topK);
         break; // got a result (possibly an empty array)
       } catch (e) {
         console.error(`[search] pipeline attempt ${attempt + 1}/3 failed for ${payload.user_id}: ${(e as Error).message}`);
