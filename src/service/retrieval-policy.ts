@@ -102,7 +102,7 @@ export function isTaskQuery(query: string): boolean {
  * selfReferenceFactor already applies to aggregation. Verified 0 flips out of
  * assistant-content and all pre-existing classification tests unchanged.
  */
-const AGGREGATION_RE = /\bhow many\b|\bhow much\b|\bhow long\b|\btotal\b|\ball the\b|\beach of\b|\blist (?:all|the|of)\b|\b(?:average|mean|sum|combined)\b|\bthe most\b/i;
+const AGGREGATION_RE = /\bhow many\b|\bhow much\b|\bhow long\b|\btotal\b|\ball the\b|\beach of\b|\blist (?:all|the|of)\b|\b(?:average|mean|sum|combined)\b|\bthe most\b|\b(?:summari[sz]e|summary|overview|big picture|main (?:theme|point|idea|takeaway)s?|key (?:theme|point|takeaway)s?|across (?:all|my|the) (?:sessions?|conversations?|histories|whole history))\b/i;
 
 /** Time reasoning: needs event dates and an explicit reference point. */
 const TEMPORAL_RE = /\bwhen\b|\bhow (?:many|long).{0,30}\b(?:ago|before|after|since)\b|\bbetween\b.{0,40}\band\b|\bfirst to last\b|\b(?:first|last|earlier|earliest|latest|recent(?:ly)?)\b|\border\b|\b(?:before|after) (?:the|my|that)\b|\bsince\b|\b\d+\s*(?:days?|weeks?|months?|years?) ago\b/i;

@@ -634,6 +634,24 @@ async function searchPipeline(
         score: 0.999,
         created_at: now(),
       });
+    } else {
+      // The Search contract carries no question date, so without this fallback
+      // the answer model has no reference "now" for temporal computation
+      // (official C1 dates/relative-time scored 20.00). AID-ONLY: the ranking
+      // boost still keys off questionDate alone, so no evidence order can
+      // change — enforced by the drift harness evidence-sequence invariant.
+      const latest = pool.reduce((acc, r) => {
+        const d = r.metadata["date"] as string | undefined;
+        return d && d > acc ? d : acc;
+      }, "");
+      if (latest) {
+        aids.push({
+          id: "temporal_anchor",
+          content: `[Temporal reference — the most recent dated memory in this store is ${latest}. Every record's header line gives its own date; compute "N days/weeks before or after" directly from those dates.]`,
+          score: 0.999,
+          created_at: now(),
+        });
+      }
     }
   }
 

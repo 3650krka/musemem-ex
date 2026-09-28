@@ -224,6 +224,10 @@ test("canonical memory-benchmark question shapes stay non-task and keep their cl
   for (const q of textual) assert.ok(!isTaskQuery(q), `must not be task-shaped: ${q}`);
   assert.equal(classifyQuestion("How many projects have I led?"), "aggregation");
   assert.equal(classifyQuestion("When did I adopt my second cat?"), "temporal");
+  // synthesis phrasings now share the aggregation completeness budget (F1=0:
+  // summarisation questions never got enough of the history)
+  assert.equal(classifyQuestion("Summarise the key events across all sessions."), "aggregation");
+  assert.equal(classifyQuestion("Give me an overview of my projects."), "aggregation");
 });
 
 test("task queries are never self-reference boosted (no accidental re-ranking)", () => {

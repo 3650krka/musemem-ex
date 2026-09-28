@@ -203,20 +203,27 @@ async function runSuite(label, port, dataDir) {
 function compare(base, cur) {
   let fail = 0;
   const rows = [];
+  const AIDS = ["timeline_index", "counting_aid", "contrast_pairs", "temporal_anchor"];
+  const evIds = (x) => x.ids.filter((id) => !AIDS.includes(id));
   for (const b of base) {
     const c = cur.find((x) => x.store === b.store && x.query === b.query);
     const key = `${b.store}|${b.query}`;
     const expected = EXPECTED_CHANGE.has(key);
     const idsSame = JSON.stringify(b.ids) === JSON.stringify(c.ids);
+    // strongest invariant: dropping aid records, the EVIDENCE sequence must be
+    // identical unless the query is whitelisted for a real behaviour change
+    const evSame = JSON.stringify(evIds(b)) === JSON.stringify(evIds(c));
     const bytesDelta = Math.abs(b.bytes - c.bytes) / Math.max(1, b.bytes);
     const drifted = !idsSame || bytesDelta > 0.02;
     if (expected) {
       if (!drifted) { rows.push(`DEAD?  ${key.slice(0, 70)} — change expected but NOTHING moved`); fail++; }
-      else rows.push(`ok(exp) ${key.slice(0, 60)} bytes ${b.bytes} -> ${c.bytes}`);
+      else if (!evSame) rows.push(`ok(exp) ${key.slice(0, 60)} bytes ${b.bytes} -> ${c.bytes} [evidence sequence CHANGED]`);
+      else rows.push(`ok(exp) ${key.slice(0, 60)} bytes ${b.bytes} -> ${c.bytes} [evidence order intact]`);
+    } else if (!evSame) {
+      rows.push(`DRIFT! ${key.slice(0, 70)} evidence order changed ${evIds(b).length}->${evIds(c).length}`);
+      fail++;
     } else if (drifted) {
-      rows.push(`DRIFT! ${key.slice(0, 70)} bytes ${b.bytes} -> ${c.bytes} idsSame=${idsSame}`);
-      if (b.store !== "s_coding") fail++;
-      else if (b.query.includes("diff history")) fail++; // non-task query on coding store must stay stable
+      rows.push(`aid-only ${key.slice(0, 66)} bytes ${b.bytes} -> ${c.bytes}`);
     } else rows.push(`ok     ${key.slice(0, 66)} (${b.bytes}b)`);
   }
   console.log(rows.join("\n"));
