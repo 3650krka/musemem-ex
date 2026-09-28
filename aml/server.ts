@@ -11,7 +11,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs";
 
 import { buildCountingAid } from "../src/service/counting-aid.ts";
 import { classifyQuestion, budgetForClass, selfReferenceFactor } from "../src/service/retrieval-policy.ts";
@@ -39,12 +39,23 @@ const TOP_K = Number(process.env.AML_TOP_K ?? 100);
 // from the server's own account instead of from AML's one-line summary.
 const LOG_BUFFER: string[] = [];
 const LOG_BUFFER_MAX = 2000;
+// The ring buffer dies with the process: a deploy between smoke runs erased
+// the coding-smoke [REQ] trace we needed for diagnosis. Persist every captured
+// line to disk (rotated at ~6MB) so /debug-log survives restarts.
+const LOG_FILE = join(DATA_DIR, "aml-requests.log");
 function captureLog(level: string, args: unknown[]): void {
   const line =
     `[${new Date().toISOString()}] [${level}] ` +
     args.map((a) => (typeof a === "string" ? a : (() => { try { return JSON.stringify(a); } catch { return String(a); } })())).join(" ");
   LOG_BUFFER.push(line);
   if (LOG_BUFFER.length > LOG_BUFFER_MAX) LOG_BUFFER.splice(0, LOG_BUFFER.length - LOG_BUFFER_MAX);
+  try {
+    if (existsSync(LOG_FILE) && statSync(LOG_FILE).size > 6_000_000) {
+      const keep = readFileSync(LOG_FILE, "utf8").split("\n").slice(-800).join("\n");
+      writeFileSync(LOG_FILE, keep + "\n");
+    }
+    appendFileSync(LOG_FILE, line + "\n");
+  } catch { /* logging must never break the request path */ }
 }
 const _origError = console.error.bind(console);
 const _origLog = console.log.bind(console);
@@ -792,9 +803,63 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   // smoke can be diagnosed from the server's own per-request account (the AML
   // smoke report only gives a one-line summary).
   if (path === "/debug-log" && req.method === "GET") {
-    const n = Math.min(Number(url.searchParams.get("lines") ?? 400) || 400, LOG_BUFFER_MAX);
+    const n = Math.min(Number(url.searchParams.get("lines") ?? 400) || 400, 50000);
+    let lines = LOG_BUFFER.slice(-n);
+    try {
+      if (existsSync(LOG_FILE)) lines = readFileSync(LOG_FILE, "utf8").split("\n").filter(Boolean).slice(-n);
+    } catch { /* fall back to ring */ }
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end(LOG_BUFFER.slice(-n).join("\n"));
+    res.end(lines.join("\n"));
+    return;
+  }
+
+  // ---- read-only diagnostics (auth-gated): find and inspect platform stores ----
+  // /scopes lists per-user store directories (size, record count, mtime) so a
+  // smoke run can be located after the fact; /peek?scope=<dir>&limit=N returns
+  // stored evidence verbatim to verify content fidelity of what the platform
+  // actually sent in /add (coding diffs truncation was a live hypothesis).
+  if (path === "/scopes" && req.method === "GET") {
+    const out: Array<Record<string, unknown>> = [];
+    try {
+      for (const d of readdirSync(DATA_DIR, { withFileTypes: true })) {
+        if (!d.isDirectory()) continue;
+        let recs = 0, bytes = 0;
+        try {
+          for (const f of readdirSync(join(DATA_DIR, d.name))) {
+            if (f.endsWith(".L0.jsonl")) {
+              const p = join(DATA_DIR, d.name, f);
+              bytes += statSync(p).size;
+              recs += readFileSync(p, "utf8").split("\n").filter(Boolean).length;
+            }
+          }
+        } catch { /* partial */ }
+        if (recs > 0) out.push({ scope: d.name, records: recs, bytes, mtime: statSync(join(DATA_DIR, d.name)).mtimeMs });
+      }
+    } catch { /* empty */ }
+    out.sort((a, b) => Number(b.mtime) - Number(a.mtime));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ scopes: out.slice(0, 80) }));
+    return;
+  }
+  if (path === "/peek" && req.method === "GET") {
+    const scope = url.searchParams.get("scope") ?? "";
+    const limit = Math.min(Number(url.searchParams.get("limit") ?? 10) || 10, 50);
+    const safe = scope.replace(/[^a-zA-Z0-9._-]/g, "_");
+    if (!safe || safe.includes("..")) { res.writeHead(400); res.end("{\"error\":\"bad scope\"}"); return; }
+    const dir = join(DATA_DIR, safe);
+    const recs: unknown[] = [];
+    try {
+      for (const f of readdirSync(dir)) {
+        if (!f.endsWith(".L0.jsonl")) continue;
+        for (const l of readFileSync(join(dir, f), "utf8").split("\n").filter(Boolean)) {
+          try { const r = JSON.parse(l); recs.push({ id: r.id, turn: r.turn, metadata: r.metadata, content: String(r.content) }); } catch { /* skip */ }
+          if (recs.length >= limit) break;
+        }
+        if (recs.length >= limit) break;
+      }
+    } catch { /* missing scope */ }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ scope: safe, count: recs.length, records: recs }));
     return;
   }
 

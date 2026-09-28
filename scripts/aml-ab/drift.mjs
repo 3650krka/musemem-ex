@@ -71,6 +71,29 @@ const STORES = {
     for (let i = 0; i < 26; i++) t.push([pad(`user: [ab][s1][T${i}][diff] src/mod${i % 5}/handler.go @@ -${i * 4},+${i * 4} @@ func handle${i}(ctx) error { if err := retry${i}.Backoff(ctx, deadline); err != nil { return wrap(err) } return nil }`, 2600)]);
     return t;
   })()]]},
+
+  // value-override store: same attribute stated repeatedly with NEWER values
+  // (the D1 "current state" failure mode: newest must win, stale must not)
+  s_updates: { chunks: [["s1", ["2024-06-01", "2024-06-20", "2024-07-05"], [
+    ["I work at BrightPath Software as a senior engineer", "Nice — senior engineer at BrightPath, noted"],
+    ["Actually I moved to Nimbus Corp last month, I am a staff engineer there now", "Congratulations on the move to Nimbus"],
+    ["Correction: I am now the engineering director at Nimbus Corp", "Director — a big step up"],
+  ]]]},
+  // event-ordering store: three dated events whose order matters (C2)
+  s_order: { chunks: [["s1", ["2024-03-04", "2024-03-18", "2024-04-02"], [
+    ["On March fourth I registered for the marathon", "Good — training starts now"],
+    ["On March eighteenth I twisted my ankle during a run", "Ouch — rest it properly"],
+    ["On April second I ran the marathon anyway with a brace", "You finished — remarkable"],
+  ]]]},
+  // sensitive-information store for privacy-minimal-disclosure probes (H2)
+  s_privacy: { chunks: [["s1", ["2024-08-01"], [
+    ["My health plan covers therapy twice a month; my therapist is Dr. Hale", "Noted — I will keep that private"],
+  ]]]},
+  // streaming store: later turns carry the up-to-date answer (I1 online learning)
+  s_stream: { chunks: [
+    ["s1", ["2024-09-01"], [["I am learning Rust with the ownership book", "Rust ownership is worth the pain"]]],
+    ["s2", ["2024-09-15"], [["I switched to Go now, my team standardised on it", "Go is a pragmatic team choice"]]],
+  ]},
 };
 
 const QUERIES = [
@@ -88,6 +111,20 @@ const QUERIES = [
   ["s_refdoc", "According to the rules, what does a calibration above threshold 7 require?"],
   ["s_refdoc", "What does the documentation say about how often logs are reviewed?"],
   ["s_coding", "According to the diff history, how does the retry deadline path behave overall?"],
+  // weak-capability regression surface (must stay byte-stable unless a change
+  // targets them on purpose)
+  ["s_updates", "Where do I work now and what is my title?"],
+  ["s_updates", "What is my current job?"],
+  ["s_updates", "Did I change companies?"],
+  ["s_order", "What happened first: the ankle injury or the marathon?"],
+  ["s_order", "In what order did I register, get injured and run the marathon?"],
+  ["s_order", "How many days between registering and running the marathon?"],
+  ["s_privacy", "What should you know about my health before suggesting a training plan?"],
+  ["s_privacy", "Who is my therapist?"],
+  ["s_stream", "Which language am I currently learning?"],
+  ["s_stream", "What did my team standardise on?"],
+  ["s_life", "Summarise everything important about my life across all sessions."],
+  ["s_refdoc", "Which thresholds need supervisory sign off?"],
 ];
 // The ONLY queries allowed to change between base and current.
 const EXPECTED_CHANGE = new Set([
