@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   classifyQuestion,
+  isTaskQuery,
   budgetForClass,
   selfReferenceFactor,
   userCharShare,
@@ -158,4 +159,73 @@ test("balanced records are left unchanged (centered at 0.5 share)", () => {
   const f = selfReferenceFactor("personal-fact", balanced);
   // share ~0.5 → centered ~0 → factor ~1.0 (small deviation from prefix lengths)
   assert.ok(f >= 1 && f < 1.1, `balanced record near-neutral, got ${f.toFixed(3)}`);
+});
+
+// ---- task class: genericity guard (coding-track budget vs textual-track parity) ----
+//
+// The coding smoke scored localization 100% / taskSolve 0% because two
+// textual-side escalations fired on repo-history stores and handed the coding
+// agent ~78K chars per response. Recognition is by QUERY SHAPE only, so these
+// tests pin both directions: engineering-shaped queries must become `task`, and
+// real memory-benchmark questions must NOT (that is the regression this change
+// could otherwise cause).
+
+test("engineering-shaped queries classify as task (tight budget, no escalation)", () => {
+  const tasks = [
+    "The retry backoff logic in src/cache/handler.go is wrong, the rate limiter lets bursts through. Fix it.",
+    "How do I add cancellation to the cache eviction path?",
+    "implement pagination for the /orders endpoint and add unit tests",
+    "refactor the debounce logic so a request is not fired per keystroke",
+    "fix the null pointer exception thrown by parser.ts on empty input",
+    "write a migration that backfills the order_id column without a table lock",
+  ];
+  for (const q of tasks) assert.ok(isTaskQuery(q), `expected task shape: ${q}`);
+  assert.equal(classifyQuestion("implement pagination for the /orders endpoint and add unit tests"), "task");
+});
+
+test("task budget is tight and below the default class", () => {
+  assert.equal(budgetForClass("task"), 10000);
+  assert.ok(budgetForClass("task") < budgetForClass("default"));
+});
+
+test("the 11 real smoke queries are NOT task-shaped (textual track parity)", () => {
+  const seenInPlatformTraffic = [
+    "When did Caroline go to the LGBTQ support group?",
+    "What fields would Caroline be likely to pursue in her education?",
+    "Have I obtained an API key for this project?",
+    "Can you list the order in which I brought up different aspects of implementing the weather app?",
+    "What does the camera's movement and the crowding into the elevator most strongly indicate about the Foreman's role?",
+    "A courtroom demonstration includes someone miming the act of unfastening a chain. What does this reveal?",
+    "What does the Foreman's behavior most strongly indicate about his role in the group deliberations?",
+    "How would you describe the overall OTC uptake rate exhibited on MIL-53(Al)@RH as a percentage of the initial mass?",
+    "CONVERSATION TRANSCRIPT",
+    "What are some ways to make my weekend reading time feel more relaxing and immersive?",
+    "What kind of warm-up should I do before a casual game of pickup basketball?",
+  ];
+  for (const q of seenInPlatformTraffic)
+    assert.ok(!isTaskQuery(q), `must not be task-shaped: ${q}`);
+});
+
+test("canonical memory-benchmark question shapes stay non-task and keep their classes", () => {
+  // The guard that matters: none of these may be pulled into the tight task
+  // budget. Exact classes come from the pre-existing rules above (aggregation
+  // is checked before temporal, so "how long" is aggregation, etc.); re-assert
+  // only the two that are unambiguous by construction.
+  const textual = [
+    "What did I do last weekend?",
+    "How long had I been running before I got injured?",
+    "When did I adopt my second cat?",
+    "How many projects have I led?",
+    "What advice did the assistant give about my schedule?",
+    "What is the name of the restaurant mentioned in the first conversation?",
+    "Where did I buy that jacket?",
+    "What kind of music do I enjoy while working?",
+  ];
+  for (const q of textual) assert.ok(!isTaskQuery(q), `must not be task-shaped: ${q}`);
+  assert.equal(classifyQuestion("How many projects have I led?"), "aggregation");
+  assert.equal(classifyQuestion("When did I adopt my second cat?"), "temporal");
+});
+
+test("task queries are never self-reference boosted (no accidental re-ranking)", () => {
+  assert.equal(selfReferenceFactor("task", rec("user: something the user said")), 1);
 });

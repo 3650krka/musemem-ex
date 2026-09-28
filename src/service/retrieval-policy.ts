@@ -32,7 +32,52 @@ import type { MemoryRecord } from "../core/types.ts";
 
 // ---- Question classification ----
 
-export type QuestionClass = "aggregation" | "temporal" | "personal-fact" | "assistant-content" | "default";
+export type QuestionClass = "task" | "aggregation" | "temporal" | "personal-fact" | "assistant-content" | "default";
+
+/**
+ * Engineering-task query: a request to change or repair code, recognised from
+ * the QUERY SHAPE only (no dataset names, no benchmark knowledge).
+ *
+ * MEASURED failure this closes (AML coding-track smoke): both tasks scored
+ * localization 100% / taskSolve 0% — retrieval found the right places, but the
+ * downstream coding agent could not use what it was handed. The cause was
+ * volume. Two textual-side escalations fire on repository-history stores:
+ * the reference-document whole-document budget (a single-session, single-voice,
+ * large store looks exactly like a rulebook) and the 30K personal-fact budget
+ * ("how do I add cancellation" contains "I"). A local probe against our own
+ * endpoint measured one response at 78,032 chars / 21 records — 12.4x the
+ * first-place system's 6,312-char returnSize.
+ *
+ * Coding's own measured sweet spot is tight: bench/aml-mirror at ~8.2K beat
+ * full 60K context on all three columns. So task-shaped queries get a precision
+ * budget and are excluded from BOTH escalations (see aml/server.ts).
+ *
+ * Deliberately conservative: natural-language memory questions ("What did I
+ * say about my trip?", "How would you describe the OTC uptake rate...") must
+ * NOT match, or this would regress the textual track. Requires a code artifact,
+ * or an imperative verb aimed at an engineering object, or failure vocabulary
+ * tied to engineering context.
+ */
+const CODE_ARTIFACT_RE =
+  /\b[\w./-]+\.(?:go|py|ts|tsx|js|jsx|mjs|cjs|java|kt|kts|rs|c|h|cc|cpp|hpp|rb|php|swift|m|scala|dart|lua|pl|pm|sh|bash|zsh|fish|sql|json|jsonc|ya?ml|toml|ini|cfg|conf|env|lock|md|markdown|html?|css|sc?css|less|xml|proto|tf|gradle|groovy|ex(?:s)?|clj|hs|ml|nim|zig)\b/i;
+const CODE_TOKEN_RE =
+  /`[^`\n]{2,}`|::|=\>|\b(?:def|func|fn)\s+[A-Za-z_]\w*|\b[A-Za-z_$][a-z0-9]+(?:[A-Z][a-zA-Z0-9]+){2,}\b|\b[a-z][a-z0-9]*(?:_[a-z0-9]+){2,}\b|\b\w+\([^)\n]*\)\s*=>/;
+const TASK_IMPERATIVE_RE =
+  /^\s*(?:please\s+)?(?:fix|repair|debug|implement|add|write|create|build|refactor|update|change|modify|replace|migrate|optimi[zs]e|extend|remove|delete|handle|configure|install|patch|resolve|address|set up)\b/i;
+const TASK_HOWTO_RE =
+  /^\s*(?:how|what|which|where)\b[^?]{0,40}\b(?:do|does|can|could|should|would|will)\s+(?:i|we|you)\b/i;
+const TASK_FAILURE_RE =
+  /\b(?:crash\w*|stack trace|traceback|seg(?:ment)?fault|null(?:pointer| reference)|type error|compilation error|build (?:error|failure)|test(?:s)? (?:fail|fails|failing|failed)|failing test|runtime error|exception|panic|core dump|deadlock|memory leak|race condition|off-by-one)\b|\b(?:is|are|was|were|keeps|kept|still)\s+(?:broken|failing|crashing|throwing|timing out|wrong)\b/i;
+const TASK_OBJECT_RE =
+  /\b(?:function|method|endpoint|handler|module|class definition|interface|component|service|worker|daemon|middleware|parser|serializer|cache|caching|pagination|rate limit\w*|rate limiter|retry|retries|backoff|debounce|throttle|validation|auth(?:entication|_token)?|token refresh|queue|consumer|producer|migration|schema|db index|test suite|unit test|integration test|docker(?:file)?|ci\/cd|logger|metrics|tracing|cancel\w*|deadline|timeout|error handling|logging|stack\w*)\b/i;
+
+export function isTaskQuery(query: string): boolean {
+  const artifact = CODE_ARTIFACT_RE.test(query) || CODE_TOKEN_RE.test(query);
+  const imperative = TASK_IMPERATIVE_RE.test(query) || TASK_HOWTO_RE.test(query);
+  const failure = TASK_FAILURE_RE.test(query);
+  const object = TASK_OBJECT_RE.test(query);
+  return artifact || (imperative && (object || failure)) || (failure && object);
+}
 
 /**
  * Completeness-critical: the answer is a sum/count/average over a distributed set.
@@ -79,6 +124,9 @@ const PERSONAL_FACT_RE = /\bI\b|\bmy\b|\bme\b|\bmine\b|\bmyself\b/i;
  * personal-fact so "what did you recommend about my X" keeps assistant records.
  */
 export function classifyQuestion(query: string): QuestionClass {
+  // Task first: engineering phrasings routinely contain "I" or how-to framing,
+  // which previously routed them into the 30K personal-fact budget.
+  if (isTaskQuery(query)) return "task";
   if (ASSISTANT_CONTENT_RE.test(query)) return "assistant-content";
   if (AGGREGATION_RE.test(query)) return "aggregation";
   if (TEMPORAL_RE.test(query)) return "temporal";
@@ -108,11 +156,14 @@ export function classifyQuestion(query: string): QuestionClass {
  * temporal is now the WIDEST class, above aggregation: date-arithmetic
  * questions need both endpoints of an interval, and their accuracy only
  * moved at 60K (20% -> 40%) while multi-session was already flat 30K -> 60K,
- * so aggregation keeps 40K. default stays at 12000: it is the class coding
- * queries fall into (no first-person, no aggregation/temporal markers), and
- * the coding track's measured sweet spot is a tight ~8-12K payload.
- * CL-Bench rulebooks are unaffected — reference-document stores override the
- * class budget with the document size (isReferenceDoc path).
+ * so aggregation keeps 40K. default stays at 12000 for plain open-ended
+ * questions that carry no first-person, aggregation or temporal marker.
+ * Coding queries are no longer in `default`: they match the `task` class above
+ * and take a tight 10K budget, and they are excluded from the reference-document
+ * and small-pool escalations (a single-session repo-history store otherwise
+ * looks identical in shape to a rulebook and inherits its whole-document budget).
+ * CL-Bench rulebooks keep the isReferenceDoc override — those queries are
+ * natural-language and do not match the task shape.
  *
  * UPDATE (60K+timeline arm, temporal+multi-session, 10 questions):
  *   60K no-TL  5/10 (temporal 1/5, multi 3/5)
@@ -129,6 +180,9 @@ export function classifyQuestion(query: string): QuestionClass {
  * requests top_k=100, so these budgets take effect in production.
  */
 const BUDGET_BY_CLASS: Record<QuestionClass, number> = {
+  // Coding-track precision budget: the measured sweet spot (~8.2K) beat full
+  // context, and the leader's returnSize is ~6.3K.
+  task: 10000,
   aggregation: 60000,
   temporal: 60000,
   "personal-fact": 30000,

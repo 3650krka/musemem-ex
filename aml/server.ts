@@ -408,6 +408,7 @@ async function searchPipeline(
   query: string,
   questionDate: string | undefined,
   topK: number,
+  optionText = "",
 ): Promise<Array<{ id: string; content: string; score: number; created_at: string }>> {
   const scope = scopeFor(userId);
   const pool = scope.store.readEvidence(userId);
@@ -416,8 +417,27 @@ async function searchPipeline(
   console.error(`[DEBUG] user=${userId} pool=${pool.length} turns=${scope.turns} class=${qClass} policy=${policy} threshold=${DEFAULT_CONFIG.activationThreshold}`);
   if (!pool.length) return [];
 
+  // Multiple-choice options (contract field `options`) carry the discriminative
+  // terms of the question — the stem alone often under-specifies what to look
+  // for. They join the RETRIEVAL text but not the classification, so an option
+  // that happens to contain "how many" cannot silently change the budget class.
+  const retrievalQuery = optionText ? `${query}\n${optionText}` : query;
+
+  // Temporal reference point. The Search contract sends only
+  // query/options/user_id/top_k — the platform never sends a question date — so
+  // an anchor that depended on one was dead code and relative-time questions
+  // ("how many days ago") had no "today" to compute against. Fall back to the
+  // store's own latest record date: within one conversation the most recent
+  // timestamp is the closest available proxy for now.
+  const referenceDate =
+    questionDate ??
+    pool.reduce((latest, r) => {
+      const d = r.metadata["date"];
+      return typeof d === "string" && d > latest ? d : latest;
+    }, "");
+
   // Phase 1: lexical-only ranking to find top candidates (fast, ~100ms).
-  const lexRanked = rankForContext(pool, scope.turns + 1, query, {
+  const lexRanked = rankForContext(pool, scope.turns + 1, retrievalQuery, {
     level0Pct: DEFAULT_CONFIG.level0Pct,
     level1Pct: DEFAULT_CONFIG.level1Pct,
   });
@@ -440,7 +460,7 @@ async function searchPipeline(
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const vecs = await encodeWithCache(scope.store, userId, pool, gw);
-        const qv = await gw.encodeQuery(query);
+        const qv = await gw.encodeQuery(retrievalQuery);
         semanticScores = poolChunkScores(vecs, qv);
         console.error(`[DEBUG] semantic ok: ${semanticScores?.size ?? 0} entries (full pool)`);
         break;
@@ -457,7 +477,7 @@ async function searchPipeline(
   // reduces all scores by w, pushing everything below the activation threshold.
   let ranked;
   try {
-    ranked = rankForContext(pool, scope.turns + 1, query, {
+    ranked = rankForContext(pool, scope.turns + 1, retrievalQuery, {
       level0Pct: DEFAULT_CONFIG.level0Pct,
       level1Pct: DEFAULT_CONFIG.level1Pct,
       semanticScores,
@@ -471,7 +491,7 @@ async function searchPipeline(
       scoreWeights: { overlap: 0.6, rs: 0.2, ss: 0.2 },
     });
     console.error(`[DEBUG] rankForContext returned ${ranked.length}`);
-    const anchor = parseYMD(questionDate);
+    const anchor = parseYMD(referenceDate);
     ranked = ranked.map((r) => {
       let s = r.score;
       if (anchor) {
@@ -522,7 +542,7 @@ async function searchPipeline(
   // Cross-encoder rerank: reorder the top candidates so paraphrase-gap gold
   // records surface. Reorder-only and fail-closed; the budget loop below is
   // unchanged and still caps the payload.
-  finalRanked = await rerankCandidates(finalRanked, query);
+  finalRanked = await rerankCandidates(finalRanked, retrievalQuery);
 
   const results: Array<{ id: string; content: string; score: number; created_at: string }> = [];
 
@@ -571,10 +591,13 @@ async function searchPipeline(
     }
     // Explicit reference date for temporal computation — the answer model
     // needs to know "today" to compute "how many days/weeks/months ago".
-    if (questionDate) {
+    if (referenceDate) {
+      // Declarative metadata, not an instruction to the answer model: name the
+      // date the memories are anchored to and let it do the arithmetic.
+
       aids.push({
         id: "temporal_anchor",
-        content: `[Reference date: ${questionDate}. Compute all time differences from this date.]`,
+        content: `[Temporal reference — the latest timestamp among the memories above is ${referenceDate}. Relative expressions inside a memory ("yesterday", "last week", "three days ago") are anchored to that memory's own session date.]`,
         score: 0.999,
         created_at: now(),
       });
@@ -621,7 +644,13 @@ async function searchPipeline(
   const poolChars = pool.reduce((s, r) => s + r.content.length, 0);
   const assistantRecords = pool.filter((r) => /\nassistant:|^assistant:/i.test(r.content)).length;
   const singleVoice = assistantRecords / Math.max(1, pool.length) < 0.2;
-  const isReferenceDoc = distinctSessions <= 2 && poolChars > 20000 && singleVoice;
+  // Task-shaped queries are excluded from the whole-document override: a
+  // repository-history store is single-session, single-voice and large, so it is
+  // indistinguishable from a rulebook by SHAPE alone — and escalating it handed the
+  // coding agent 78,032 chars in one measured response (12.4x the leader's
+  // returnSize, with localization 100% / taskSolve 0%). Natural-language rule
+  // questions keep the override.
+  const isReferenceDoc = distinctSessions <= 2 && poolChars > 20000 && singleVoice && qClass !== "task";
   // Small pools: a pool that fits within a modest cap must be returned WHOLE.
   // The class budget exists to bound a LARGE pool for answer-model precision;
   // applying it to a small pool only cuts source records that the evaluator
@@ -885,7 +914,12 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       return;
     }
     const topK = Math.min(payload.top_k ?? TOP_K, 200);
-    console.error(`[REQ] search user=${payload.user_id} top_k=${topK} q="${payload.query.slice(0, 80)}"`);
+    // Multiple-choice options arrive at the Search top level (contract: no gold
+    // answer in them), so matching on them is ordinary query expansion.
+    const optionText = Array.isArray(payload.options)
+      ? payload.options.filter((o): o is string => typeof o === "string" && o.trim().length > 0).join("\n")
+      : "";
+    console.error(`[REQ] search user=${payload.user_id} top_k=${topK} opts=${optionText ? optionText.split("\n").length : 0} q="${payload.query.slice(0, 80)}"`);
     // NEVER return an error/timeout to AML: a non-200 is counted as "no Search
     // record" and fails the smoke. Retry the pipeline internally and wait for a
     // result; on persistent failure return a degraded-but-valid 200 (empty data
@@ -893,7 +927,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     let results: Awaited<ReturnType<typeof searchPipeline>> = [];
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        results = await searchPipeline(payload.user_id, payload.query, payload.question_date, topK);
+        results = await searchPipeline(payload.user_id, payload.query, payload.question_date, topK, optionText);
         break; // got a result (possibly an empty array)
       } catch (e) {
         console.error(`[search] pipeline attempt ${attempt + 1}/3 failed for ${payload.user_id}: ${(e as Error).message}`);
