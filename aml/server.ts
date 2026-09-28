@@ -244,23 +244,38 @@ function ingestMessages(
   sessScope: string,
   sessionId: string,
 ): void {
-  // Derive date from first timestamp (AML sends epoch seconds or ms)
-  const ts = messages.find((m) => m.timestamp)?.timestamp;
-  const date = ts ? new Date(ts > 1e12 ? ts : ts * 1000).toISOString().split("T")[0] : "";
-
   scope.turns += 1;
   const turn = scope.turns;
 
+  // AML sends a timestamp PER MESSAGE. The old behaviour stamped every record a
+  // chunk produced with the FIRST message's date, throwing the rest away —
+  // measured: 10 messages spanning 10 distinct days all came back headed with
+  // day one. That silently degraded every date-dependent mechanism (the temporal
+  // reference point, timeline date groups, temporal recency weighting, event
+  // ordering), i.e. exactly the capabilities the official breakdown scored
+  // weakest: C1 dates/relative time 20.00, C2 event ordering 60.00. Each record
+  // now carries the date of its own messages, and a date change flushes the
+  // buffer so no record spans two days.
+  const fallbackDate = (() => {
+    const ts = messages.find((m) => m.timestamp)?.timestamp;
+    return ts ? new Date(ts > 1e12 ? ts : ts * 1000).toISOString().split("T")[0] : "";
+  })();
+  const dayOf = (m: { timestamp?: number }): string =>
+    m.timestamp
+      ? new Date(m.timestamp > 1e12 ? m.timestamp : m.timestamp * 1000).toISOString().split("T")[0]
+      : fallbackDate;
+
   let buf: string[] = [];
   let len = 0;
+  let bufDate = "";
   const flush = () => {
     if (!buf.length) return;
-    const content = date
-      ? `[${date}] (session ${sessionId})\n${buf.join("\n")}`
+    const content = bufDate
+      ? `[${bufDate}] (session ${sessionId})\n${buf.join("\n")}`
       : buf.join("\n");
     scope.store.appendEvidence(sessScope, baseRecord(
       recordId(sessionId, scope.recordCount),
-      content, turn, { sessionId, date },
+      content, turn, { sessionId, date: bufDate },
     ));
     scope.recordCount += 1;
     buf = []; len = 0;
@@ -268,25 +283,21 @@ function ingestMessages(
 
   for (const m of messages) {
     const line = `${m.role}: ${m.content}`;
-    // A message is an ATOMIC record unit — NEVER split it. AML's smoke checks
-    // that every expected Search record (the message as the platform sent it)
-    // appears in our results; splitting a >RECORD_CHARS message (a CL-Bench
-    // rulebook of 4-36K chars, a 1295-char beam turn) left NO single record
-    // containing it — measured 7-67% best single-record containment — which is
-    // exactly the smoke failure "expected=18, actual=11" (6 of the 7 missing
-    // were CL-Bench rulebook/task messages, the 7th a long beam turn).
-    // The original reason for splitting — the budget loop dropping a giant
-    // record mid-list — is now handled two ways below: the isReferenceDoc
-    // detection sizes the budget to the document, and the budget loop always
-    // admits the TOP-RANKED evidence record even when it alone exceeds the
-    // budget. Short messages still join into <=RECORD_CHARS records (a joined
-    // record still CONTAINS each message verbatim, so the check keeps passing).
+    const day = dayOf(m);
+    // A message is an ATOMIC record unit — NEVER split it. Splitting a
+    // >RECORD_CHARS message (a CL-Bench rulebook of 4-36K chars, a long beam
+    // turn) left no single record containing it; the reference-document path and
+    // the always-admit-top-record guard handle one oversized record instead.
     if (line.length > RECORD_CHARS) {
       if (buf.length) flush();
+      bufDate = day;
       buf.push(line); len = line.length;
-      flush(); // one whole-message record
+      flush();
       continue;
     }
+    // Keep a record within one day: a date change is a record boundary.
+    if (bufDate !== day && buf.length) flush();
+    bufDate = day;
     if (len + line.length > RECORD_CHARS && buf.length) flush();
     buf.push(line);
     len += line.length;
