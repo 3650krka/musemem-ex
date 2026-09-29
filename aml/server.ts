@@ -226,11 +226,11 @@ async function synthesizeProfile(userId: string, recordCount: number, pool: Memo
   const lines: string[] = [];
   if (feed) {
     // v11: feed = current query's TOP-RANKED user-heavy records. The per-session
-    // even sampling below provably diluted the signal (measured: the battery
-    // question's power-bank record sat at rank 41 and never reached the
-    // synthesizer, which then produced an off-topic profile; the hotel question
-    // returned NO_RELEVANT_HISTORY although the Seattle hotel-view preference
-    // was rank 0). Retrieval already ranks by relevance — synthesize over THAT.
+    // even sampling below provably diluted the signal (measured cases had the
+    // decisive record at rank 41, never reaching the
+    // synthesiser, which then produced an off-topic profile, or at rank 0 yet
+    // still missed by a history-wide sweep: it returned NO_RELEVANT_HISTORY
+    // although the decisive preference was rank 0). Retrieval already ranks by relevance — synthesise over THAT.
     for (const r of feed) {
       const body = r.content.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*\(session [^)]+\)\s*\n?/, "").slice(0, 400);
       if (body.trim()) lines.push(body);
@@ -261,25 +261,25 @@ async function synthesizeProfile(userId: string, recordCount: number, pool: Memo
     ].join("\n")
     : [
       // Query-conditioned (v8): the generic whole-history profile is provably
-      // incomplete — on 2026-09-28 it omitted the user's high-school history,
+      // incomplete — when it omits the one fact the question needs,
       // and the answer model treated the profile as exhaustive, answering
       // "no relevant memories" while the evidence sat right below it. Conditioning
       // on the question surfaces the relevant slice; the NOT-exhaustive header
       // keeps the answer model reading the raw evidence too.
-      // v9: topic-level relevance — "hotel for Miami" must surface the user's
-      // general hotel preferences (views, rooftop pools) even though no memory
-      // mentions Miami literally. Literal conditioning returned
+      // v9: topic-level relevance — a question about a NEW instance of a known
+      // preference category must surface the user's general preference for that
+      // category even when no memory mentions the new instance. Literal conditioning
       // NO_RELEVANT_HISTORY and the question failed aidless (measured 2026-09-28).
       `The user is now asking: "${query}"`,
       topicLevel
         ? "Below are statements the user made across past conversations. Write 3-6 third-person sentences describing the user's experiences, interests, and preferences that relate to the TOPIC of this question — including the user's general habits and preferences about such topics even when they never mention the specific item or place. Quote specifics (names, places, numbers, dates) whenever present."
         : transfer
-          // v12: transferable rules. Measured failure (2026-09-28, three immune
-          // questions): the profile accurately described a PAST episode (Seattle
-          // hotel with a view) yet the answer model replied "no Miami hotels in
-          // memory" — it does not transfer episodic preferences to new contexts.
+          // v12: transferable rules. Measured failure (three immune
+          // questions): the profile accurately described a PAST episode, yet the
+          // answer model reported having no memory for a NEW instance of that
+          // category — it does not transfer episodic preferences on its own.
           // Phrasing the same fact as a general rule unblocks the transfer.
-          ? "Below are statements the user made across past conversations. Write 3-6 third-person sentences describing ONLY the user's experiences, interests, and preferences that help answer this question. Quote specifics (names, places, numbers, dates) whenever present, AND phrase each point as the user's GENERAL preference pattern that transfers to new situations — e.g. 'when choosing hotels, the user values great views and rooftop pools, whatever the destination' or 'the user already owns a portable power bank'."
+          ? "Below are statements the user made across past conversations. Write 3-6 third-person sentences describing ONLY the user's experiences, interests, and preferences that help answer this question. Quote specifics (names, places, numbers, dates) whenever present, AND phrase each point as the user's GENERAL preference pattern that transfers to new situations — state the category-level rule rather than only the past episode, and note items the user already owns or has already done."
           : "Below are statements the user made across past conversations. Write 3-6 third-person sentences describing ONLY the user's experiences, interests, and preferences that help answer this question. Quote specifics (names, places, teams, numbers, dates) whenever present. Draw on ALL relevant statements below, even ones that seem minor.",
       "If absolutely nothing relates to the topic, respond with exactly: NO_RELEVANT_HISTORY",
       "",
@@ -614,10 +614,10 @@ async function rerankCandidates<T extends { record: { id: string; content: strin
 }
 
 // ---- v13: as-of date anchoring from the QUERY TEXT ----
-// MEASURED failure this closes (live smoke store, D1 = 8.33): the platform's
-// overwrite questions read "What is X's job title as of September 5, 2025?" and
+// MEASURED failure this closes: overwrite / current-state questions put the
+// date in the QUESTION TEXT ("... as of <Month D, Y>") and
 // carry NO question_date field, so `anchor` stays null and the temporal path
-// never runs — the returned set mixed Sep-06 records into a Sep-05 question.
+// never runs, so records dated AFTER the asked-about day can outrank the state
 // "as of" is also absent from temporal.ts's preposition list, so even
 // parseTimeExpressions misses that date. Deterministic, zero-LLM, and scoped to
 // queries literally containing an as-of / 截至 date, so nothing else changes.
@@ -641,18 +641,18 @@ function parseAsOfDate(query: string): DateYMD | null {
 const pad2 = (n: number): string => String(n).padStart(2, "0");
 
 // ---- v14: broader anchor forms + explicit current-state intent ----
-// MEASURED gap (live smoke log, 39 questions): v13's "as of" pattern covered
-// only 3 of the 6 date/state questions. Uncovered: "On Sep 05, 2025, what was
-// X's job title" (on-date), "2024-01-12记录的...药物名称" (bare ISO), and
-// "右膝晨僵时长从最初的10分钟，变化成当前是多少分钟" (asks the CURRENT value,
-// no date at all). D1 scored 8.33 (1/12) with all three forms present.
+// MEASURED gap: v13 recognised only the "as of <date>" idiom, which covers
+// only part of the date/state question forms. Uncovered: an on-date
+// preposition ("On <Mon> <D>, <Y>, what was ..."), a bare ISO date inside the
+// question, and an explicit current-state intent carrying no date at all
+// (the question quotes the OLD value and asks for the NEW one).
 // GUARD: a global recency boost is what the reverted e2fc2d1 anchor-derivation
 // did and it was blamed for a smoke regression, so current-state mode fires
 // ONLY on an explicit current/latest token and NEVER on past-event questions
 // ("When did...", "哪一年"), which need the OLD record to win.
 const ON_DATE_RE = /\bon\s+([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})/i;
 const ISO_DATE_RE = /\b(\d{4})-(\d{1,2})-(\d{1,2})\b/;
-const CURRENT_STATE_RE = /\b(?:current|currently|now|latest|most recent|as of today)\b|当前|现在|最新|变化成/i;
+const CURRENT_STATE_RE = /\b(?:current|currently|now|latest|most recent|as of today)\b|当前|现在|最新/i;
 const PAST_QUESTION_RE = /^\s*(?:when|which year|what year|in which year)\b|什么时候|哪一年|何时/i;
 
 function parseQueryAnchor(query: string): DateYMD | null {
