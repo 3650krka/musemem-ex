@@ -23,7 +23,7 @@ import { rankForContext } from "../src/core/ranker.ts";
 import { encodeWithCache, poolChunkScores, type EmbedGateway } from "../src/adapters/embed.ts";
 import { buildTimelineIndex, TEMPORAL_PROMPT_RE } from "../src/core/timeline.ts";
 import { renderContrastLines } from "../src/service/contrast.ts";
-import { temporalBoostFactor, type DateYMD } from "../src/core/temporal.ts";
+import { temporalBoostFactor, parseRecordDate, type DateYMD } from "../src/core/temporal.ts";
 import { retrievalParamsFor } from "../src/core/retrieval-params.ts";
 import { DEFAULT_CONFIG, type MemoryRecord } from "../src/core/types.ts";
 
@@ -111,7 +111,7 @@ console.log = (...args: unknown[]) => { captureLog("log", args); _origLog(...arg
  * Full argument, per-type decomposition and the classifier check that killed the
  * conditional are in src/service/trace-select.ts.
  */
-const KNOWN_POLICIES = ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"] as const;
+const KNOWN_POLICIES = ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"] as const;
 type Policy = (typeof KNOWN_POLICIES)[number];
 
 /**
@@ -613,6 +613,33 @@ async function rerankCandidates<T extends { record: { id: string; content: strin
   }
 }
 
+// ---- v13: as-of date anchoring from the QUERY TEXT ----
+// MEASURED failure this closes (live smoke store, D1 = 8.33): the platform's
+// overwrite questions read "What is X's job title as of September 5, 2025?" and
+// carry NO question_date field, so `anchor` stays null and the temporal path
+// never runs — the returned set mixed Sep-06 records into a Sep-05 question.
+// "as of" is also absent from temporal.ts's preposition list, so even
+// parseTimeExpressions misses that date. Deterministic, zero-LLM, and scoped to
+// queries literally containing an as-of / 截至 date, so nothing else changes.
+const ASOF_MONTHS: Record<string, number> = {
+  january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, july: 7, august: 8,
+  september: 9, october: 10, november: 11, december: 12,
+  jan: 1, feb: 2, mar: 3, apr: 4, jun: 6, jul: 7, aug: 8, sep: 9, sept: 9, oct: 10, nov: 11, dec: 12,
+};
+function parseAsOfDate(query: string): DateYMD | null {
+  const a = query.match(/\bas of\s+([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})/i);
+  if (a) {
+    const mon = ASOF_MONTHS[a[1].toLowerCase()];
+    return mon ? { y: Number(a[3]), m: mon, d: Number(a[2]) } : null;
+  }
+  const b = query.match(/\bas of\s+(\d{4})-(\d{1,2})-(\d{1,2})/i);
+  if (b) return { y: Number(b[1]), m: Number(b[2]), d: Number(b[3]) };
+  const c = query.match(/截至\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+  if (c) return { y: Number(c[1]), m: Number(c[2]), d: Number(c[3]) };
+  return null;
+}
+const pad2 = (n: number): string => String(n).padStart(2, "0");
+
 async function searchPipeline(
   userId: string,
   query: string,
@@ -624,6 +651,9 @@ async function searchPipeline(
   const pool = scope.store.readEvidence(userId);
   const qClass = classifyQuestion(query);
   const policy = ACTIVE_POLICY;
+  // v13: as-of anchor parsed from the query text (declared here so both the
+  // re-ranking block and the aid block below can see it).
+  const asOf = policy === "v13" ? parseAsOfDate(query) : null;
   console.error(`[DEBUG] user=${userId} pool=${pool.length} turns=${scope.turns} class=${qClass} policy=${policy} threshold=${DEFAULT_CONFIG.activationThreshold}`);
   if (!pool.length) return [];
 
@@ -688,7 +718,20 @@ async function searchPipeline(
       scoreWeights: { overlap: 0.6, rs: 0.2, ss: 0.2 },
     });
     console.error(`[DEBUG] rankForContext returned ${ranked.length}`);
-    const anchor = parseYMD(questionDate);
+    if (asOf) {
+    const asOfMs = Date.UTC(asOf.y, asOf.m - 1, asOf.d);
+    ranked = ranked.map((r) => {
+      const d = parseRecordDate(r.record.metadata["date"] as string | undefined);
+      if (!d) return r;
+      // daysBefore > 0 → record precedes the as-of date (a valid state);
+      // < 0 → it describes a LATER change and must not win an as-of question.
+      const daysBefore = Math.round((asOfMs - Date.UTC(d.y, d.m - 1, d.d)) / 86400000);
+      const factor = daysBefore < 0 ? 0.6 : 1 + 0.25 * Math.exp(-daysBefore / 14);
+      return { ...r, score: r.score * factor };
+    });
+    console.error(`[DEBUG] as-of anchor ${asOf.y}-${pad2(asOf.m)}-${pad2(asOf.d)} applied to ${ranked.length} records`);
+  }
+  const anchor = parseYMD(questionDate);
     ranked = ranked.map((r) => {
       let s = r.score;
       if (anchor) {
@@ -761,6 +804,16 @@ async function searchPipeline(
   // indices over that evidence. Its measured value for the answer model was also
   // never isolated, unlike the temporal index.
   const aids: Array<{ id: string; content: string; score: number; created_at: string }> = [];
+  // v13: name the as-of anchor for the answer model (declarative metadata, not
+  // an instruction) so a later record is not read as the current state.
+  if (asOf) {
+    aids.push({
+      id: "asof_anchor",
+      content: `[Temporal reference — the question asks about the state AS OF ${asOf.y}-${pad2(asOf.m)}-${pad2(asOf.d)}. Memories dated after that day describe LATER changes, not the state being asked about.]`,
+      score: 0.9995,
+      created_at: new Date().toISOString(),
+    });
+  }
   const now = () => new Date().toISOString();
 
   // v3: self-initiated disclosure extraction. Carries the verbatim clause that
@@ -804,7 +857,7 @@ async function searchPipeline(
       // (official C1 dates/relative-time scored 20.00). AID-ONLY: the ranking
       // boost still keys off questionDate alone, so no evidence order can
       // change — enforced by the drift harness evidence-sequence invariant.
-      const latest = pool.reduce((acc, r) => {
+      const latest = asOf ? "" : pool.reduce((acc, r) => {
         const d = r.metadata["date"] as string | undefined;
         return d && d > acc ? d : acc;
       }, "");
