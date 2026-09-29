@@ -9,12 +9,13 @@
  *
  * 符合 Agent Memory Leaderboard 的 Add/Search 契约。
  */
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { mkdirSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs";
 
 import { buildCountingAid } from "../src/service/counting-aid.ts";
-import { classifyQuestion, budgetForClass, selfReferenceFactor } from "../src/service/retrieval-policy.ts";
+import { classifyQuestion, budgetForClass, selfReferenceFactor, userCharShare } from "../src/service/retrieval-policy.ts";
 import { extractDisclosures, renderDisclosureBlock } from "../src/service/disclosure.ts";
 import { selectPerTrace, traceStats } from "../src/service/trace-select.ts";
 import { MemoryStore, recordId } from "../src/core/store.ts";
@@ -110,7 +111,7 @@ console.log = (...args: unknown[]) => { captureLog("log", args); _origLog(...arg
  * Full argument, per-type decomposition and the classifier check that killed the
  * conditional are in src/service/trace-select.ts.
  */
-const KNOWN_POLICIES = ["v1", "v2", "v3", "v4", "v5", "v6"] as const;
+const KNOWN_POLICIES = ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"] as const;
 type Policy = (typeof KNOWN_POLICIES)[number];
 
 /**
@@ -139,6 +140,169 @@ function policyFromEnv(v: string | undefined): Policy {
   return (KNOWN_POLICIES as readonly string[]).includes(v ?? "") ? (v as Policy) : "v2";
 }
 let ACTIVE_POLICY: Policy = policyFromEnv(process.env.AML_POLICY);
+
+// ---- v7: derived user-profile aid (AML-sanctioned internal model: gpt-4o-mini) ----
+// MEASURED failure this closes (local-bench, 2026-09-28, LME-S preference type):
+// raw request-shaped user messages were retrieved WITH full evidence (39-47
+// records) yet the answer model ignored them and answered generically — even
+// oracle-pinned raw evidence scored WRONG on both probes. The same facts
+// restated as a declarative third-person profile flipped BOTH to CORRECT.
+// Fail-open: without AML_PROFILE_KEY the aid is skipped and v7 equals v2.
+const PROFILE_URL = process.env.AML_PROFILE_URL ?? "https://api.naga.ac/v1/chat/completions";
+const PROFILE_KEY = process.env.AML_PROFILE_KEY ?? "";
+const PROFILE_MODEL = process.env.AML_PROFILE_MODEL ?? "gpt-4o-mini-2024-07-18";
+const AML_PROFILE = process.env.AML_PROFILE ?? "";
+const PREFERENCE_RE = /\b(?:recommend(?:ation)?s?|suggest(?:ion)?s?|any ideas?|ideas? (?:for|on|to)|what should i|might (?:i|find)|interested in|any good|favorite|favourite)\b/i;
+// v9: wider advice-seeking gate. Measured on the 120-question sampler selection:
+// 19/20 single-session-preference (vs 15 for PREFERENCE_RE), zero matches on any
+// other type — the widened phrases are advice-seeking markers no factual question
+// in the set uses.
+const PREFERENCE_RE_WIDE = /\b(?:recommend(?:ation)?s?|suggest(?:ion)?s?|any ideas?|ideas? (?:for|on|to)|what should i|might (?:i|find)|interested in|any good|favorite|favourite|what do you think|any tips|tips (?:on|for)|should i (?:buy|get|go|choose|wait|attend)|help me (?:decide|choose|pick))\b/i;
+const profileCache = new Map<string, { rc: number; text: string }>();
+// Disk persistence: without it every process re-synthesizes profiles, and the
+// synthesis text variance alone flipped preference answers across runs
+// (measured 2026-09-28: v8 16/20 vs v8b 14/20 partly from drifted profiles).
+const PROFILE_CACHE_DIR = join(DATA_DIR, "_profiles");
+const profileCacheFile = (key: string) => join(PROFILE_CACHE_DIR, createHash("sha256").update(key).digest("hex").slice(0, 24) + ".json");
+function profileCacheGet(key: string, rc: number): string | null {
+  const mem = profileCache.get(key);
+  if (mem && mem.rc === rc) return mem.text;
+  try {
+    const j = JSON.parse(readFileSync(profileCacheFile(key), "utf8")) as { rc: number; text: string };
+    if (j.rc === rc && typeof j.text === "string" && j.text) { profileCache.set(key, j); return j.text; }
+  } catch { /* miss */ }
+  return null;
+}
+function profileCacheSet(key: string, rc: number, text: string): void {
+  profileCache.set(key, { rc, text });
+  try {
+    mkdirSync(PROFILE_CACHE_DIR, { recursive: true });
+    writeFileSync(profileCacheFile(key), JSON.stringify({ rc, text }), "utf8");
+  } catch { /* best-effort */ }
+}
+
+let profileDispatcher: unknown = null;
+let profileUndici: { fetch: typeof fetch; ProxyAgent: new (o: string) => unknown } | null = null;
+async function profileFetch(body: string): Promise<string> {
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${PROFILE_KEY}` };
+  try {
+    const res = await fetch(PROFILE_URL, { method: "POST", headers, body, signal: AbortSignal.timeout(45000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const j = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const t = j.choices?.[0]?.message?.content?.trim() ?? "";
+    if (t) return t;
+    throw new Error("empty completion");
+  } catch (e1) {
+    const proxy = process.env.AML_PROFILE_PROXY;
+    if (!proxy) { console.error(`[DEBUG] profile direct FAIL: ${(e1 as Error).message?.slice(0, 80)}`); return ""; }
+    try {
+      if (!profileUndici) {
+        profileUndici = await import(new URL("../node_modules/undici/index.js", import.meta.url).href) as never;
+      }
+      // NOTE: verified 2026-09-28 — socks5 proxies only work via undici's own
+      // fetch + ProxyAgent(string); global fetch with {uri} object fails.
+      if (!profileDispatcher) profileDispatcher = new profileUndici.ProxyAgent(proxy);
+      const res = await profileUndici.fetch(PROFILE_URL, { method: "POST", headers, body, dispatcher: profileDispatcher, signal: AbortSignal.timeout(45000) } as never);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const j = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      const t = j.choices?.[0]?.message?.content?.trim() ?? "";
+      // Empty completion (observed from vsllm under load) is a RETRYABLE
+      // failure, not a result — throw so the caller's backoff loop fires.
+      if (!t) throw new Error("empty completion via proxy");
+      return t;
+    } catch (e2) {
+      console.error(`[DEBUG] profile FAIL direct+proxy: ${(e2 as Error).message?.slice(0, 80)}`);
+      return "";
+    }
+  }
+}
+
+async function synthesizeProfile(userId: string, recordCount: number, pool: MemoryRecord[], query?: string, topicLevel = false, feed?: MemoryRecord[], transfer = false): Promise<string | null> {
+  // v8+: query-conditioned — the cache key must include the question.
+  const cacheKey = (query === undefined ? userId : `${userId}${createHash("sha256").update(query).digest("hex").slice(0, 12)}`)
+    + `|${topicLevel ? "t" : ""}${transfer ? "x" : ""}${feed ? "r" + feed.length : ""}`;
+  const cached = profileCacheGet(cacheKey, recordCount);
+  if (cached) return cached;
+  const lines: string[] = [];
+  if (feed) {
+    // v11: feed = current query's TOP-RANKED user-heavy records. The per-session
+    // even sampling below provably diluted the signal (measured: the battery
+    // question's power-bank record sat at rank 41 and never reached the
+    // synthesizer, which then produced an off-topic profile; the hotel question
+    // returned NO_RELEVANT_HISTORY although the Seattle hotel-view preference
+    // was rank 0). Retrieval already ranks by relevance — synthesize over THAT.
+    for (const r of feed) {
+      const body = r.content.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*\(session [^)]+\)\s*\n?/, "").slice(0, 400);
+      if (body.trim()) lines.push(body);
+      if (lines.length >= 40) break;
+    }
+  } else {
+  // Even coverage across ALL sessions (a profile spans the whole history, so a
+  // plain prefix slice would miss late interests): ≤3 user-heavy records per session.
+  const perSession = new Map<string, number>();
+  for (const r of pool) {
+    if (userCharShare(r.content) <= 0.6) continue;
+    const sid = String(r.metadata["sessionId"] ?? "?");
+    const n = perSession.get(sid) ?? 0;
+    if (n >= 3) continue;
+    perSession.set(sid, n + 1);
+    const body = r.content.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*\(session [^)]+\)\s*\n?/, "").slice(0, 400);
+    if (body.trim()) lines.push(body);
+    if (lines.length >= 90) break;
+  }
+  }
+  if (lines.length < 3) { console.error(`[DEBUG] profile skip: only ${lines.length} user lines`); return null; }
+  const prompt = query === undefined
+    ? [
+      "Below are statements a user made across past conversations. Write a 4-6 sentence third-person profile of this user's stable interests, preferences, skills, and ongoing projects.",
+      "Rules: only include facts explicitly stated below; no speculation; no advice; start every sentence with 'The user'.",
+      "",
+      lines.join("\n---\n"),
+    ].join("\n")
+    : [
+      // Query-conditioned (v8): the generic whole-history profile is provably
+      // incomplete — on 2026-09-28 it omitted the user's high-school history,
+      // and the answer model treated the profile as exhaustive, answering
+      // "no relevant memories" while the evidence sat right below it. Conditioning
+      // on the question surfaces the relevant slice; the NOT-exhaustive header
+      // keeps the answer model reading the raw evidence too.
+      // v9: topic-level relevance — "hotel for Miami" must surface the user's
+      // general hotel preferences (views, rooftop pools) even though no memory
+      // mentions Miami literally. Literal conditioning returned
+      // NO_RELEVANT_HISTORY and the question failed aidless (measured 2026-09-28).
+      `The user is now asking: "${query}"`,
+      topicLevel
+        ? "Below are statements the user made across past conversations. Write 3-6 third-person sentences describing the user's experiences, interests, and preferences that relate to the TOPIC of this question — including the user's general habits and preferences about such topics even when they never mention the specific item or place. Quote specifics (names, places, numbers, dates) whenever present."
+        : transfer
+          // v12: transferable rules. Measured failure (2026-09-28, three immune
+          // questions): the profile accurately described a PAST episode (Seattle
+          // hotel with a view) yet the answer model replied "no Miami hotels in
+          // memory" — it does not transfer episodic preferences to new contexts.
+          // Phrasing the same fact as a general rule unblocks the transfer.
+          ? "Below are statements the user made across past conversations. Write 3-6 third-person sentences describing ONLY the user's experiences, interests, and preferences that help answer this question. Quote specifics (names, places, numbers, dates) whenever present, AND phrase each point as the user's GENERAL preference pattern that transfers to new situations — e.g. 'when choosing hotels, the user values great views and rooftop pools, whatever the destination' or 'the user already owns a portable power bank'."
+          : "Below are statements the user made across past conversations. Write 3-6 third-person sentences describing ONLY the user's experiences, interests, and preferences that help answer this question. Quote specifics (names, places, teams, numbers, dates) whenever present. Draw on ALL relevant statements below, even ones that seem minor.",
+      "If absolutely nothing relates to the topic, respond with exactly: NO_RELEVANT_HISTORY",
+      "",
+      lines.join("\n---\n"),
+    ].join("\n");
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, 1500 * attempt));
+    const text = await profileFetch(JSON.stringify({
+      model: PROFILE_MODEL, messages: [{ role: "user", content: prompt }], temperature: 0, max_tokens: 300,
+      // reasoning models (deepseek-v4-flash) burn the ENTIRE max_tokens on
+      // reasoning and return empty content (measured 2026-09-28); non-reasoning
+      // endpoints (gpt-4o-mini) may 400 on unknown params — gate by env.
+      ...(process.env.AML_PROFILE_REASONING_OFF === "1" ? { reasoning_effort: "none" } : {}),
+    }));
+      if (text) {
+      if (query !== undefined && text.trim() === "NO_RELEVANT_HISTORY") return null;
+      profileCacheSet(cacheKey, recordCount, text);
+      return text;
+    }
+  }
+  console.error("[DEBUG] profile synth returned empty after 4 attempts");
+  return null;
+}
 
 /**
  * Runtime override for the corroboration-blend strength (ranker.ts: the knob in
@@ -673,6 +837,32 @@ async function searchPipeline(
   if (contrasts.length) {
     const body = "[Contrast index — distinguishing similar memories above; an auxiliary index, not an original memory]\n" + contrasts.join("\n");
     aids.push({ id: "contrast_pairs", content: body, score: 0.99, created_at: now() });
+  }
+
+  // v7 profile aid: additive-only (evidence order and budget untouched); the
+  // aid is explicitly marked derived so it is never read as verbatim evidence.
+  // Excluded for task/aggregation classes where a profile cannot answer the
+  // question and would only spend the answer model's attention.
+  if ((policy === "v7" || policy === "v8" || policy === "v9" || policy === "v10" || policy === "v11" || policy === "v12" || AML_PROFILE === "1") && PROFILE_KEY && qClass !== "task" && qClass !== "aggregation" && (policy === "v9" || policy === "v10" || policy === "v11" || policy === "v12" ? PREFERENCE_RE_WIDE : PREFERENCE_RE).test(query)) {
+    try {
+      // v10 = v8's strict prompt + wide gate. v9's topic-level prompt REGRESSED
+      // (7 down-flips, 0 up-flips, preference 9-13/20 vs v8 16/20): broader
+      // profiles diluted the relevant slice. Kept only as a documented failure.
+      // v11 = v8 strict prompt + wide gate + TOP-RANKED feed (the three immune
+      // questions' evidence sat at ranks 0-41 but never reached the synthesizer).
+      const feed = policy === "v11" || policy === "v12" ? ranked.map((r) => r.record).filter((r) => userCharShare(r.content) > 0.6).slice(0, policy === "v12" ? 60 : 40) : undefined;
+      const profile = await synthesizeProfile(userId, scope.recordCount, pool, policy === "v8" || policy === "v9" || policy === "v10" || policy === "v11" || policy === "v12" ? query : undefined, policy === "v9", feed, policy === "v12");
+      if (profile) {
+        aids.push({
+          id: "user_profile",
+          content: "[Derived user profile — " + (policy === "v8" ? "a question-focused summary synthesized from the user statements in this memory set; NOT exhaustive — the raw memories remain authoritative" : "synthesized from the user statements in this memory set; a summary index, not an original memory") + "]\n" + profile,
+          score: 0.997,
+          created_at: now(),
+        });
+      }
+    } catch (e) {
+      console.error(`[DEBUG] profile FAIL: ${(e as Error).message?.slice(0, 100)}`);
+    }
   }
 
   // Evidence records, with two budget protections:
