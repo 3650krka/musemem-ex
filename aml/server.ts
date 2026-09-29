@@ -1134,7 +1134,11 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           scope = scopeFor(payload.user_id);
-          ingestMessages(stitchPartMessages(payload.messages), scope, payload.user_id, payload.session_id);
+          // AML_STITCH=0 disables [part k/m] reassembly (A/B isolation: the
+          // stitch changed record granularity between the 61.40 smoke and the
+          // regressed smokes; this gate lets one deploy answer both ways).
+          const msgs = process.env.AML_STITCH === "0" ? payload.messages : stitchPartMessages(payload.messages);
+          ingestMessages(msgs, scope, payload.user_id, payload.session_id);
           storeErr = null;
           break;
         } catch (e) {
