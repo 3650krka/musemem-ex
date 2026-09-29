@@ -111,7 +111,7 @@ console.log = (...args: unknown[]) => { captureLog("log", args); _origLog(...arg
  * Full argument, per-type decomposition and the classifier check that killed the
  * conditional are in src/service/trace-select.ts.
  */
-const KNOWN_POLICIES = ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"] as const;
+const KNOWN_POLICIES = ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16"] as const;
 type Policy = (typeof KNOWN_POLICIES)[number];
 
 /**
@@ -640,6 +640,34 @@ function parseAsOfDate(query: string): DateYMD | null {
 }
 const pad2 = (n: number): string => String(n).padStart(2, "0");
 
+// ---- v14: broader anchor forms + explicit current-state intent ----
+// MEASURED gap (live smoke log, 39 questions): v13's "as of" pattern covered
+// only 3 of the 6 date/state questions. Uncovered: "On Sep 05, 2025, what was
+// X's job title" (on-date), "2024-01-12记录的...药物名称" (bare ISO), and
+// "右膝晨僵时长从最初的10分钟，变化成当前是多少分钟" (asks the CURRENT value,
+// no date at all). D1 scored 8.33 (1/12) with all three forms present.
+// GUARD: a global recency boost is what the reverted e2fc2d1 anchor-derivation
+// did and it was blamed for a smoke regression, so current-state mode fires
+// ONLY on an explicit current/latest token and NEVER on past-event questions
+// ("When did...", "哪一年"), which need the OLD record to win.
+const ON_DATE_RE = /\bon\s+([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})/i;
+const ISO_DATE_RE = /\b(\d{4})-(\d{1,2})-(\d{1,2})\b/;
+const CURRENT_STATE_RE = /\b(?:current|currently|now|latest|most recent|as of today)\b|当前|现在|最新|变化成/i;
+const PAST_QUESTION_RE = /^\s*(?:when|which year|what year|in which year)\b|什么时候|哪一年|何时/i;
+
+function parseQueryAnchor(query: string): DateYMD | null {
+  const explicit = parseAsOfDate(query);
+  if (explicit) return explicit;
+  const on = query.match(ON_DATE_RE);
+  if (on) {
+    const mon = ASOF_MONTHS[on[1].toLowerCase()];
+    if (mon) return { y: Number(on[3]), m: mon, d: Number(on[2]) };
+  }
+  const iso = query.match(ISO_DATE_RE);
+  if (iso) return { y: Number(iso[1]), m: Number(iso[2]), d: Number(iso[3]) };
+  return null;
+}
+
 async function searchPipeline(
   userId: string,
   query: string,
@@ -653,7 +681,22 @@ async function searchPipeline(
   const policy = ACTIVE_POLICY;
   // v13: as-of anchor parsed from the query text (declared here so both the
   // re-ranking block and the aid block below can see it).
-  const asOf = policy === "v13" ? parseAsOfDate(query) : null;
+  let asOf: DateYMD | null = policy === "v13" ? parseAsOfDate(query) : null;
+  let asOfKind: "asof" | "current" = asOf ? "asof" : "current";
+  if (policy === "v14" || policy === "v15") {
+    asOf = parseQueryAnchor(query);
+    asOfKind = "asof";
+    if (!asOf && CURRENT_STATE_RE.test(query) && !PAST_QUESTION_RE.test(query)) {
+      // Current-state question with no date: anchor on the newest record in the
+      // store so the latest value outranks the superseded one it mentions.
+      const latest = pool.reduce((acc, r) => {
+        const d = r.metadata["date"] as string | undefined;
+        return d && d > acc ? d : acc;
+      }, "");
+      const d = parseRecordDate(latest);
+      if (d) { asOf = d; asOfKind = "current"; }
+    }
+  }
   console.error(`[DEBUG] user=${userId} pool=${pool.length} turns=${scope.turns} class=${qClass} policy=${policy} threshold=${DEFAULT_CONFIG.activationThreshold}`);
   if (!pool.length) return [];
 
@@ -809,7 +852,9 @@ async function searchPipeline(
   if (asOf) {
     aids.push({
       id: "asof_anchor",
-      content: `[Temporal reference — the question asks about the state AS OF ${asOf.y}-${pad2(asOf.m)}-${pad2(asOf.d)}. Memories dated after that day describe LATER changes, not the state being asked about.]`,
+      content: asOfKind === "current"
+        ? `[Temporal reference — the question asks for the CURRENT/LATEST state. The most recent dated memory in this store is ${asOf.y}-${pad2(asOf.m)}-${pad2(asOf.d)}; for the same attribute, that latest value supersedes earlier ones.]`
+        : `[Temporal reference — the question asks about the state AS OF ${asOf.y}-${pad2(asOf.m)}-${pad2(asOf.d)}. Memories dated after that day describe LATER changes, not the state being asked about.]`,
       score: 0.9995,
       created_at: new Date().toISOString(),
     });
@@ -1284,7 +1329,19 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         // A/B and the textual smoke regressed 61.40 -> 51.68 (B2 50 -> 0,
         // D1 41.67 -> 8.33, G4 50 -> 0). The opts= log line stays so a future
         // attempt can be measured on a sample before it goes live.
-        results = await searchPipeline(payload.user_id, payload.query, payload.question_date, topK);
+        // v15/v16: fold the platform's multiple-choice options into the
+        // RETRIEVAL text (never into the classification, never into the
+        // returned content). MEASURED gap: every B2 narrative-inference question
+        // in the live smoke arrives with opts=4-6, and B2 scored 0.00 — the stem
+        // alone ("someone miming the act of unfastening a chain") under-specifies
+        // the target, while the options carry the discriminative terms. The
+        // earlier revert of this mechanism was attributed to a smoke regression
+        // that the revert itself did NOT undo (G4/F1 stayed 0 afterwards), and
+        // the platform has since shown run-to-run variance, so the attribution
+        // was never established. Kept behind policies so /policy can A/B it
+        // without a redeploy.
+        const foldOptions = ACTIVE_POLICY === "v15" || ACTIVE_POLICY === "v16";
+        results = await searchPipeline(payload.user_id, payload.query, payload.question_date, topK, foldOptions ? optionText : "");
         break; // got a result (possibly an empty array)
       } catch (e) {
         console.error(`[search] pipeline attempt ${attempt + 1}/3 failed for ${payload.user_id}: ${(e as Error).message}`);
