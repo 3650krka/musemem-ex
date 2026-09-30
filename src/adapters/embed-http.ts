@@ -124,8 +124,30 @@ async function callEmbeddings(preset: RemoteEmbedPreset, key: string, texts: str
     }
     throw new Error(`embed HTTP ${res.status}: ${detail}`);
   }
-  const j = (await res.json()) as { data: Array<{ embedding: number[] }> };
-  return j.data.map((d) => Float32Array.from(d.embedding));
+  const j = (await res.json()) as { data: Array<{ embedding: number[]; index?: number }> };
+  const data = Array.isArray(j.data) ? j.data : [];
+  // Two silent-corruption modes measured on this path:
+  //  1. SHORT BATCH — a smoke Search got 1 vector back for a 10-record pool. The
+  //     caller maps vectors positionally, so 9 records ended up with no semantic
+  //     score, blended to (1-w)*lexical + w*0, fell under the activation
+  //     threshold and were dropped: the response carried 4,719 of a 60,000 char
+  //     budget. Nothing threw, so the retry loop accepted it as complete.
+  //  2. ORDER — `index` is the authoritative position in the OpenAI-compatible
+  //     contract; trusting array order instead would attach a vector to the wrong
+  //     text whenever a backend reorders or parallelises a batch.
+  // Sort by index when every item carries one, then require an exact-length
+  // result: retry as transient, and throw rather than hand back a short map.
+  const ordered = data.length && data.every((d) => typeof d.index === "number")
+    ? [...data].sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+    : data;
+  if (ordered.length !== texts.length) {
+    if (attempt + 1 < EMBED_MAX_ATTEMPTS) {
+      await new Promise((r) => setTimeout(r, 500 * (1 << attempt)));
+      return callEmbeddings(preset, key, texts, inputType, name, attempt + 1);
+    }
+    throw new Error(`embed returned ${ordered.length}/${texts.length} vectors (${name})`);
+  }
+  return ordered.map((d) => Float32Array.from(d.embedding));
 }
 
 /** Backend batch caps shrink as dims grow (measured: xfyun 4096-dim fails

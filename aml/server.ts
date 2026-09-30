@@ -731,8 +731,41 @@ async function searchPipeline(
       try {
         const vecs = await encodeWithCache(scope.store, userId, pool, gw);
         const qv = await gw.encodeQuery(retrievalQuery);
-        semanticScores = poolChunkScores(vecs, qv);
-        console.error(`[DEBUG] semantic ok: ${semanticScores?.size ?? 0} entries (full pool)`);
+        const scores = poolChunkScores(vecs, qv);
+        const got = scores?.size ?? 0;
+        // PARTIAL-EMBEDDING GUARD.
+        //
+        // MEASURED FAILURE (own request log, personal-fact query): the batch
+        // encoder returned 1 vector for a 10-record pool and threw nothing, so
+        // this loop accepted it as "full pool". A record with no semantic vector
+        // blends as (1-w)*lexical + w*0, which lands below the 0.28 activation
+        // threshold, so rankForContext dropped 9 of the 10 records — the response
+        // carried 4,719 of a 60,000 char budget while 90% of the store never
+        // reached the answer model. The next request encoded all 10 and emitted
+        // 10, which makes this a provider hiccup rather than a ranking property.
+        //
+        // The existing `semanticScores ? weight : 0` guard only covers TOTAL
+        // failure; a short map is the dangerous middle case. Retry (the sidecar
+        // keeps what already encoded, so a retry only re-requests the missing
+        // records); if coverage stays under 90%, DISCARD the semantic scores so
+        // ranking falls back to pure lexical and every record competes. The 90%
+        // floor keeps large pools with a few chunkless records on semantic
+        // ranking instead of throwing it away.
+        if (got < pool.length) {
+          const coverage = pool.length ? got / pool.length : 1;
+          console.error(`[DEBUG] semantic PARTIAL: ${got}/${pool.length} records encoded (coverage ${(coverage * 100).toFixed(0)}%, attempt ${attempt + 1}/3)`);
+          if (coverage >= 0.9) {
+            semanticScores = scores;
+            console.error(`[DEBUG] semantic partial but coverage >= 90% -> keeping semantic ranking`);
+            break;
+          }
+          if (attempt < 2) { await new Promise((r) => setTimeout(r, 800 * (attempt + 1))); continue; }
+          console.error(`[DEBUG] semantic coverage ${(coverage * 100).toFixed(0)}% after 3 attempts -> lexical-only fallback, all ${pool.length} records kept`);
+          semanticScores = undefined;
+          break;
+        }
+        semanticScores = scores;
+        console.error(`[DEBUG] semantic ok: ${got} entries (full pool)`);
         break;
       } catch (e) {
         console.error(`[DEBUG] semantic FAIL (attempt ${attempt + 1}/3): ${(e as Error).message?.slice(0, 80)}`);
