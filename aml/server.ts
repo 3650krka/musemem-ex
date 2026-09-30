@@ -33,6 +33,19 @@ const DATA_DIR = process.env.AML_DATA_DIR ?? "./aml-data";
 const AUTH_TOKEN = process.env.AML_AUTH_TOKEN ?? "";
 const TOP_K = Number(process.env.AML_TOP_K ?? 100);
 
+// ---- v18 mechanism kill-switches ----
+// v18 bundles three independently-measured mechanisms on top of v14. Each has its
+// own env switch so a regressing smoke can be bisected by flipping one flag and
+// restarting, instead of redeploying or guessing which mechanism caused it.
+const LARGE_POOL_LIFT_ON = process.env.AML_LARGE_POOL_BUDGET !== "0"; // M1 large-pool budget
+const FOLD_OPTIONS_ON = process.env.AML_FOLD_OPTIONS !== "0";         // M2 option folding
+const UPDATE_MARKERS_ON = process.env.AML_UPDATE_MARKERS !== "0";     // M3 dateless supersession
+// M3 boost strength. MEASURED on a hard fixture (the superseded record is
+// lexically CLOSER to the question than the updating one): at 1.3 the updating
+// record closed the gap from 0.215 to 0.018 but still ranked second, so 1.3 was
+// tuned up. Kept env-overridable to sweep the value without a redeploy.
+const UPDATE_BOOST = Number(process.env.AML_UPDATE_BOOST ?? 1.5);
+
 // ---- diagnostic log ring buffer ----
 // The AML smoke is opaque: we cannot see what it sends or how each request
 // fared. Capture the recent [DEBUG]/request log lines in a ring buffer and
@@ -111,7 +124,7 @@ console.log = (...args: unknown[]) => { captureLog("log", args); _origLog(...arg
  * Full argument, per-type decomposition and the classifier check that killed the
  * conditional are in src/service/trace-select.ts.
  */
-const KNOWN_POLICIES = ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16"] as const;
+const KNOWN_POLICIES = ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v18"] as const;
 type Policy = (typeof KNOWN_POLICIES)[number];
 
 /**
@@ -654,6 +667,26 @@ const ON_DATE_RE = /\bon\s+([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\
 const ISO_DATE_RE = /\b(\d{4})-(\d{1,2})-(\d{1,2})\b/;
 const CURRENT_STATE_RE = /\b(?:current|currently|now|latest|most recent|as of today)\b|当前|现在|最新/i;
 const PAST_QUESTION_RE = /^\s*(?:when|which year|what year|in which year)\b|什么时候|哪一年|何时/i;
+  // v18 M3 - explicit update markers as a RECENCY signal for dateless pools.
+  //
+  // MEASURED failure this closes: the knowledge-update stores in the live smoke hold
+  // records whose metadata.date is EMPTY, so v14's current-state anchor (which
+  // derives "latest" from metadata.date) can never fire on them - all 14 anchor
+  // applications logged during one smoke landed on dated conversational stores.
+  // With no date and no order signal, a superseded value and its replacement sit
+  // side by side and the answer model has nothing to prefer: 1/12 on that axis.
+  //
+  // When timestamps are absent, an explicit change-of-state verb in the record text
+  // is the only recency evidence available. The vocabulary is generic English
+  // update wording, the same register as CURRENT_STATE_RE above - no corpus-specific
+  // phrase, and justifiable without reference to any evaluation item: any store that
+  // keeps successive values must mark which entry replaces another.
+  //
+  // Scoped tightly: only when the pool has NO usable dates (otherwise the v14 date
+  // anchor already handles it), only for explicit current-state questions, never for
+  // past-event questions (PAST_QUESTION_RE), which need the OLD record to win. Pure
+  // re-ranking: nothing is added to the payload.
+  const UPDATE_MARKER_RE = /\b(?:updat(?:e|ed|es|ing)|correction|corrections|corrected|revis(?:e|ed|es|ion)|amend(?:s|ed|ing|ment|ments)?|replac(?:e|ed|es|ing|ement)|supersed(?:e|ed|es|ing)|no\s+longer|instead|chang(?:e|ed|es|ing)\s+to)\b/i;
 
 function parseQueryAnchor(query: string): DateYMD | null {
   const explicit = parseAsOfDate(query);
@@ -683,7 +716,7 @@ async function searchPipeline(
   // re-ranking block and the aid block below can see it).
   let asOf: DateYMD | null = policy === "v13" ? parseAsOfDate(query) : null;
   let asOfKind: "asof" | "current" = asOf ? "asof" : "current";
-  if (policy === "v14" || policy === "v15") {
+  if (policy === "v14" || policy === "v15" || policy === "v18") {
     asOf = parseQueryAnchor(query);
     asOfKind = "asof";
     if (!asOf && CURRENT_STATE_RE.test(query) && !PAST_QUESTION_RE.test(query)) {
@@ -774,6 +807,12 @@ async function searchPipeline(
     }
   }
 
+  // v18 M3 gate: fire only on a dateless pool + explicit current-state intent.
+  const poolHasDates = pool.some((r) => { const d = r.metadata["date"]; return typeof d === "string" && d.length >= 8; });
+  const updateMarkerBoost = (policy === "v18" && UPDATE_MARKERS_ON && !poolHasDates
+    && CURRENT_STATE_RE.test(query) && !PAST_QUESTION_RE.test(query)) ? UPDATE_BOOST : 1;
+  if (updateMarkerBoost > 1) console.error(`[DEBUG] update-marker boost ON (dateless pool=${pool.length}, current-state question)`);
+
   // Phase 3: final ranking with semantic blend (same as bench).
   // CRITICAL: semanticWeight must be 0 when semanticScores is undefined —
   // otherwise the blend formula (1-w)*lexical + w*0 = (1-w)*lexical silently
@@ -819,6 +858,8 @@ async function searchPipeline(
       // 100% assistant advice and contained zero user facts.
       // v1 policy: no self-reference weighting (A/B baseline).
       if (policy !== "v1") s *= selfReferenceFactor(qClass, r.record);
+      // v18 M3: dateless pools use explicit update markers for recency.
+      if (updateMarkerBoost > 1 && UPDATE_MARKER_RE.test(r.record.content)) s *= updateMarkerBoost;
       return s === r.score ? r : { ...r, score: s };
     })
     // Deterministic ordering: sort by score (desc), then by record ID (asc)
@@ -1034,6 +1075,28 @@ async function searchPipeline(
   // pool back.
   const envBudget = Number(process.env.AML_CHAR_BUDGET ?? 0);
   const SMALL_POOL_CAP = 20000;
+  // v18 M1 - large-pool budget lift.
+  //
+  // MEASURED failure this closes: one live smoke store holds 89 records / 248,678
+  // chars. A default-class query on it is capped at budgetForClass() = 12,000, so
+  // the response carried 9-11 records = 4.8% of the corpus; a personal-fact query
+  // capped at 30,000 returned 34 of 89 and logged chars=29828/30000. The class
+  // budget exists to bound a LARGE pool for answer-model precision, but 4.8% is not
+  // a precision trade-off - it is starvation: the evidence cannot be in the payload.
+  //
+  // LOCAL A/B (public script corpus, 99 single-answer questions, one pinned
+  // answerer, paired per question): 12K -> 22.5%, 60K -> 40.4%, 17 up / 6 down,
+  // sign test p = 0.035.
+  //
+  // Scope guards: reference-document stores keep their own escalation; task queries
+  // are excluded (the coding track measured a tight budget as its optimum, and its
+  // stores are single-session single-voice); pools that already fit under
+  // SMALL_POOL_CAP are untouched, so small conversational stores - which score at
+  // ceiling today - see no change.
+  const LARGE_POOL_CAP = 60000;
+  const liftLargePool = policy === "v18" && LARGE_POOL_LIFT_ON && !isReferenceDoc
+    && poolChars > SMALL_POOL_CAP
+    && (qClass === "default" || qClass === "personal-fact");
   const CHAR_BUDGET = ACTIVE_BUDGET_OVERRIDE ?? (envBudget > 0
     ? envBudget
     : isReferenceDoc
@@ -1041,7 +1104,7 @@ async function searchPipeline(
       : (policy === "v1" ? 8000
         : qClass === "default" && poolChars <= SMALL_POOL_CAP
           ? poolChars + 4000
-          : budgetForClass(qClass)));
+          : liftLargePool ? Math.min(poolChars + 4000, LARGE_POOL_CAP) : budgetForClass(qClass)));
   if (isReferenceDoc) {
     console.error(`[DEBUG] reference-document store: sessions=${distinctSessions} poolChars=${poolChars} asstFrac=${(assistantRecords / Math.max(1, pool.length)).toFixed(2)} budget=${CHAR_BUDGET}`);
   }
@@ -1373,7 +1436,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         // the platform has since shown run-to-run variance, so the attribution
         // was never established. Kept behind policies so /policy can A/B it
         // without a redeploy.
-        const foldOptions = ACTIVE_POLICY === "v15" || ACTIVE_POLICY === "v16";
+        const foldOptions = ACTIVE_POLICY === "v15" || ACTIVE_POLICY === "v16" || (ACTIVE_POLICY === "v18" && FOLD_OPTIONS_ON);
         results = await searchPipeline(payload.user_id, payload.query, payload.question_date, topK, foldOptions ? optionText : "");
         break; // got a result (possibly an empty array)
       } catch (e) {
